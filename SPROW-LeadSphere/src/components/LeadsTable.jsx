@@ -42,7 +42,7 @@ export function LeadsTable({ leads, loading }) {
     return (
       <section className="results-section">
         <div className="empty-state">
-          <span className="eyebrow">SPROW LEADSPHERE</span>
+          <span className="eyebrow">LEADSPHERE · POWERED BY NADJ.AI</span>
           <h2>Noch keine Leads</h2>
           <p>Starte eine Recherche, um Geschäftskontakte zu finden.</p>
         </div>

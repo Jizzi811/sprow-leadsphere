@@ -44,10 +44,10 @@ export async function extractUrl(url) {
 }
 
 // ---- Discover (description -> web search -> extraction) ----
-export async function discover(query, region = "", target = "") {
+export async function discover(query, region = "", target = "", includeDirectories = false) {
   return request("/api/discover", {
     method: "POST",
-    body: JSON.stringify({ query, region, target }),
+    body: JSON.stringify({ query, region, target, include_directories: includeDirectories }),
   });
 }
 

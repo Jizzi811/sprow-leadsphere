@@ -49,13 +49,22 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 # Alternative provider — set SERPAPI_KEY to use Google via SerpAPI instead.
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
-# Aggregators / directories / social — not the company sites we want to scrape.
-_SKIP_DOMAINS = {
+# Alternative provider — Tavily (AI search). Takes priority if set.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+TAVILY_ENDPOINT = "https://api.tavily.com/search"
+# Social/aggregator noise — never useful as a lead source.
+_ALWAYS_SKIP_DOMAINS = {
     "wikipedia.org", "facebook.com", "linkedin.com", "instagram.com", "youtube.com",
-    "xing.com", "twitter.com", "x.com", "amazon.de", "ebay.de", "kleinanzeigen.de",
-    "ebay-kleinanzeigen.de", "google.com", "yelp.com", "yelp.de", "pinterest.com",
-    "tiktok.com", "kununu.com", "indeed.com", "stepstone.de", "wlw.de", "11880.com",
-    "gelbeseiten.de", "dasoertliche.de", "meinestadt.de", "immobilienscout24.de",
+    "xing.com", "twitter.com", "x.com", "amazon.de", "ebay.de", "google.com",
+    "pinterest.com", "tiktok.com", "kununu.com", "indeed.com", "stepstone.de",
+    "immobilienscout24.de",
+}
+# Business directories — skipped by default, but the "companies without a
+# website" vertical searches exactly these (listings carry phone numbers).
+_DIRECTORY_DOMAINS = {
+    "wlw.de", "11880.com", "gelbeseiten.de", "dasoertliche.de", "meinestadt.de",
+    "yelp.com", "yelp.de", "kleinanzeigen.de", "ebay-kleinanzeigen.de",
+    "branchenbuch.de", "cylex.de", "golocal.de", "werliefertwas.de",
 }
 # How many company sites to scrape per search (final result cap).
 _DISCOVER_MAX_SITES = int(os.getenv("DISCOVER_MAX_SITES", "30"))
@@ -74,6 +83,8 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     region: str = ""
     target: str = ""
+    # "Firmen ohne Webseite": search directory listings instead of company sites.
+    include_directories: bool = False
 
 
 class FeedbackCreate(BaseModel):
@@ -228,14 +239,42 @@ async def _serpapi_search(query: str, want: int) -> list[dict]:
     ]
 
 
+async def _tavily_search(query: str, want: int) -> list[dict]:
+    # Tavily caps max_results at 20 per request.
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                TAVILY_ENDPOINT,
+                headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+                json={"query": query, "max_results": min(want, 20),
+                      "search_depth": "basic", "country": "germany"},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+    if resp.status_code == 429:
+        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+    if resp.status_code in (401, 403):
+        raise HTTPException(502, "Web-Suche fehlgeschlagen: Tavily-API-Key ungültig.")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Web-Suche fehlgeschlagen (Tavily {resp.status_code}).")
+    return [
+        {"url": r.get("url", ""), "title": r.get("title", ""),
+         "description": (r.get("content", "") or "")[:300]}
+        for r in resp.json().get("results", [])
+    ]
+
+
 async def _web_search(query: str, want: int) -> list[dict]:
-    """Dispatch to the configured provider (SerpAPI preferred if both set)."""
+    """Dispatch to the configured provider (priority: Tavily > SerpAPI > Brave)."""
+    if TAVILY_API_KEY:
+        return await _tavily_search(query, want)
     if SERPAPI_KEY:
         return await _serpapi_search(query, want)
     if BRAVE_API_KEY:
         return await _brave_search(query, want)
     raise HTTPException(
-        503, "Web-Suche ist nicht konfiguriert (setze SERPAPI_KEY oder BRAVE_API_KEY)."
+        503,
+        "Web-Suche ist nicht konfiguriert (setze TAVILY_API_KEY, SERPAPI_KEY oder BRAVE_API_KEY).",
     )
 
 
@@ -244,17 +283,25 @@ async def discover(payload: SearchRequest):
     query_text = " ".join(p for p in [payload.query, payload.region, payload.target] if p).strip()
     results = await _web_search(query_text, want=_SEARCH_FETCH)
 
-    # Pick distinct company sites, skipping directories / social / aggregators.
+    # Pick distinct lead sources. Default: one company site per host, skipping
+    # social + directories. Directory mode: individual listing pages count, so
+    # de-duplicate by full URL instead of host.
+    def _in(host: str, domains: set[str]) -> bool:
+        return any(host == d or host.endswith("." + d) for d in domains)
+
     seen: set[str] = set()
     candidates: list[tuple[str, str, str, str]] = []
     for item in results:
         url = item.get("url") or ""
         host = (urlparse(url).hostname or "").replace("www.", "")
-        if not host or host in seen:
+        key = url if payload.include_directories else host
+        if not host or key in seen:
             continue
-        if any(host == d or host.endswith("." + d) for d in _SKIP_DOMAINS):
+        if _in(host, _ALWAYS_SKIP_DOMAINS):
             continue
-        seen.add(host)
+        if not payload.include_directories and _in(host, _DIRECTORY_DOMAINS):
+            continue
+        seen.add(key)
         candidates.append((url, host, item.get("title", ""), item.get("description", "")))
         if len(candidates) >= _DISCOVER_MAX_SITES:
             break

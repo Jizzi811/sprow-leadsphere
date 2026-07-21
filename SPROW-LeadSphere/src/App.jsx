@@ -6,6 +6,7 @@ import { LeadsTable } from "./components/LeadsTable.jsx";
 import { HistoryTable } from "./components/HistoryTable.jsx";
 import { Dashboard } from "./components/Dashboard.jsx";
 import { ParticleOrb } from "./components/ParticleOrb.jsx";
+import { VERTICALS, composeQuery } from "./lib/verticals.js";
 import * as api from "./lib/api.js";
 
 function useToast() {
@@ -44,9 +45,11 @@ const DEMO_RUNS = [
 
 export function App() {
   const [active, setActive] = useState("Neue Recherche");
-  const [query, setQuery] = useState("Finde Hausverwaltungen in NRW");
+  const [vertical, setVertical] = useState(VERTICALS[0]);
+  const [keywords, setKeywords] = useState(VERTICALS[0].keywords);
+  const [query, setQuery] = useState("");
   const [region, setRegion] = useState("Nordrhein-Westfalen");
-  const [target, setTarget] = useState("Hausverwaltungen");
+  const [target, setTarget] = useState(VERTICALS[0].targets[0]);
   const [searching, setSearching] = useState(false);
   const [live, setLive] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -157,7 +160,7 @@ export function App() {
     setProgress(0);
     setNotice("Durchsuche das Web nach passenden Firmen … (kann bis zu einer Minute dauern)");
     try {
-      const data = await api.discover(q, region, target);
+      const data = await api.discover(q, region, target, !!vertical?.directories);
       const found = data.leads || [];
       setLeads(found);
       const [s, l] = await Promise.all([api.listSearches(50, 0), api.listLeads(null, 200, 0)]);
@@ -173,19 +176,20 @@ export function App() {
     } finally {
       setLive(false);
     }
-  }, [region, target]);
+  }, [region, target, vertical]);
 
   // ---- Submit search ----
   const startSearch = useCallback((e) => {
     e?.preventDefault();
     setActive("Neue Recherche");
-    const q = query.trim();
+    // Freitext + Zielgruppe + eigene Parameter zu einer Beschreibung komponieren.
+    const q = composeQuery({ freeText: query, target, keywords });
     if (!q) {
-      setNotice("Bitte beschreibe zuerst, wen LeadSphere finden soll.");
+      setNotice("Bitte wähle eine Branche oder beschreibe, wen LeadSphere finden soll.");
       return;
     }
     // A domain/URL -> extract that one site; a description -> discover via web search.
-    const urlMatch = q.match(/((?:https?:\/\/)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?)/i);
+    const urlMatch = query.trim().match(/^((?:https?:\/\/)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?)$/i);
     if (hasBackend) {
       if (urlMatch) runLiveExtraction(urlMatch[0]);
       else runDiscovery(q);
@@ -196,7 +200,7 @@ export function App() {
     setLeads([]);
     setProgress(0);
     setSearching(true);
-  }, [query, hasBackend, runLiveExtraction, runDiscovery]);
+  }, [query, target, keywords, hasBackend, runLiveExtraction, runDiscovery]);
 
   // ---- Delete search ----
   const handleDelete = useCallback(async (searchId) => {
@@ -260,10 +264,11 @@ export function App() {
               query={query} setQuery={setQuery}
               region={region} setRegion={setRegion}
               target={target} setTarget={setTarget}
+              vertical={vertical} setVertical={setVertical}
+              keywords={keywords} setKeywords={setKeywords}
               searching={searching} live={live}
               progress={progress}
               notice={notice} setNotice={setNotice}
-              hasBackend={hasBackend}
               onSubmit={startSearch}
             />
             {leads.length > 0 ? (
@@ -332,7 +337,7 @@ export function App() {
         return (
           <section className="placeholder-view">
             <div className="mini-orb"><ParticleOrb searching={false} /></div>
-            <span className="eyebrow">SPROW LEADSPHERE</span>
+            <span className="eyebrow">LEADSPHERE · POWERED BY NADJ.AI</span>
             <h1>{active}</h1>
             <p>Hier erscheinen alle gefundenen und geprüften Geschäftskontakte.</p>
             <button onClick={() => setActive("Neue Recherche")}>

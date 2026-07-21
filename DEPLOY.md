@@ -55,13 +55,15 @@ Render → `sprow-leadsphere-api` → **Environment** → *Add Environment Varia
 
 | Provider | Env var | Free key |
 | -------- | ------- | -------- |
-| Brave (default) | `BRAVE_API_KEY` | https://brave.com/search/api/ (~2,000/mo) |
+| Tavily (AI search) | `TAVILY_API_KEY` | https://tavily.com/ (1,000/mo) |
 | SerpAPI (Google) | `SERPAPI_KEY` | https://serpapi.com/ (100/mo) |
+| Brave | `BRAVE_API_KEY` | https://brave.com/search/api/ (~2,000/mo) |
 
-If both are set, **SerpAPI takes priority**. Without either, the app still works
-for direct website extraction; descriptions just return a clear "not configured"
-message. Optional: `DISCOVER_MAX_SITES` (default 8) caps how many sites are
-scraped per search.
+Priority when several are set: **Tavily > SerpAPI > Brave**. Without any key the
+app still works for direct website extraction; descriptions just return a clear
+"not configured" message. Optional: `DISCOVER_MAX_SITES` (default 30) caps how
+many sites are scraped per search. Note: Tavily returns at most 20 raw results
+per request, so searches top out around 15–20 leads on that provider.
 
 ## Data persistence
 

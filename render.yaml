@@ -18,14 +18,16 @@ services:
     autoDeploy: true
     envVars:
       # Enables automatic company discovery from a description. Set ONE of these
-      # in the Render dashboard (Environment). SerpAPI (Google) takes priority if
-      # both are set. Without either, the app still works for direct website
-      # extraction; descriptions just return no results.
-      #   Brave   (free ~2k/mo):  https://brave.com/search/api/
+      # in the Render dashboard (Environment). Priority: Tavily > SerpAPI > Brave.
+      # Without any, the app still works for direct website extraction.
+      #   Tavily  (free 1k/mo):   https://tavily.com/
       #   SerpAPI (free 100/mo):  https://serpapi.com/
-      - key: BRAVE_API_KEY
+      #   Brave   (free ~2k/mo):  https://brave.com/search/api/
+      - key: TAVILY_API_KEY
         sync: false
       - key: SERPAPI_KEY
+        sync: false
+      - key: BRAVE_API_KEY
         sync: false
     # No ALLOWED_ORIGINS / VITE_API_URL needed: frontend and API share an origin.
     # SQLite inside the container is EPHEMERAL on the free plan (leads reset when

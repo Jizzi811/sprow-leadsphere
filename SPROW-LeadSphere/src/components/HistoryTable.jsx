@@ -13,7 +13,7 @@ export function HistoryTable({ searches, onSelect, onDelete, loading }) {
   if (!searches.length) {
     return (
       <div className="empty-state" style={{ padding: "40px 0" }}>
-        <span className="eyebrow">SPROW LEADSPHERE</span>
+        <span className="eyebrow">LEADSPHERE · POWERED BY NADJ.AI</span>
         <h2>Noch keine Recherchen</h2>
         <p>Deine letzten Suchen erscheinen hier.</p>
       </div>
