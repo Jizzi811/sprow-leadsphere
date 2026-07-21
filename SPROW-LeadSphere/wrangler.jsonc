@@ -1,5 +1,0 @@
-{
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "sprow-leadsphere",
-  "compatibility_date": "2026-07-21"
-}

@@ -1,9 +1,0 @@
-node_modules
-dist
-.wrangler
-**/__pycache__
-*.pyc
-backend/.venv
-backend/*.db
-.env
-.env.*

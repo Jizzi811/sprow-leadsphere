@@ -1,26 +1,25 @@
 # Render blueprint for SPROW LeadSphere — a single monolithic web service that
 # serves BOTH the built frontend and the FastAPI + Scrapling API on one origin.
 #
-# In Render: New + -> Blueprint -> pick this repo -> Apply.
-# (If a previous, broken "sprow-leadsphere-api" service exists, delete it first
-#  or let the blueprint update it in place — same name.)
+# The Dockerfile lives at the repo ROOT and the build context is the repo root
+# (no rootDir), so Render resolves paths unambiguously.
+#
+# In Render: New + -> Blueprint -> pick this repo -> Apply. If a broken
+# "sprow-leadsphere-api" already exists, this updates it in place (same name).
 services:
   - type: web
     name: sprow-leadsphere-api
     runtime: docker
     repo: https://github.com/Jizzi811/sprow-leadsphere
     branch: main
-    # Build context is the app folder so the Dockerfile can build the frontend
-    # (src/) and install the backend (backend/) in one multi-stage image.
-    rootDir: SPROW-LeadSphere
     dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
     autoDeploy: true
     # No ALLOWED_ORIGINS / VITE_API_URL needed: frontend and API share an origin.
-    # SQLite lives inside the container and is EPHEMERAL on the free plan (leads
-    # reset when the instance restarts/sleeps). For durable storage, switch to a
-    # paid plan with a disk (uncomment below) or an external DB (e.g. Supabase).
+    # SQLite inside the container is EPHEMERAL on the free plan (leads reset when
+    # the instance restarts/sleeps). For durable storage switch to a paid plan
+    # with a disk (uncomment) or an external DB (e.g. Supabase).
     # envVars:
     #   - key: DATABASE_PATH
     #     value: /var/data/leadsphere.db
