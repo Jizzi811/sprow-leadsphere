@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:worker": "wrangler pages dev ./dist -- npm run build",
+    "deploy:worker": "wrangler pages deploy ./dist"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
