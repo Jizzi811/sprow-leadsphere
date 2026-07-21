@@ -265,17 +265,35 @@ async def _tavily_search(query: str, want: int) -> list[dict]:
 
 
 async def _web_search(query: str, want: int) -> list[dict]:
-    """Dispatch to the configured provider (priority: Tavily > SerpAPI > Brave)."""
-    if TAVILY_API_KEY:
-        return await _tavily_search(query, want)
+    """Provider-Kette: SerpAPI zuerst, dann Tavily, dann Brave.
+
+    Fällt automatisch auf den nächsten Provider zurück, wenn der vorige einen
+    Fehler wirft (z. B. Kontingent erschöpft) oder keine Treffer liefert.
+    """
+    providers = []
     if SERPAPI_KEY:
-        return await _serpapi_search(query, want)
+        providers.append(_serpapi_search)
+    if TAVILY_API_KEY:
+        providers.append(_tavily_search)
     if BRAVE_API_KEY:
-        return await _brave_search(query, want)
-    raise HTTPException(
-        503,
-        "Web-Suche ist nicht konfiguriert (setze TAVILY_API_KEY, SERPAPI_KEY oder BRAVE_API_KEY).",
-    )
+        providers.append(_brave_search)
+    if not providers:
+        raise HTTPException(
+            503,
+            "Web-Suche ist nicht konfiguriert (setze SERPAPI_KEY, TAVILY_API_KEY oder BRAVE_API_KEY).",
+        )
+    last_error: HTTPException | None = None
+    for search in providers:
+        try:
+            results = await search(query, want)
+        except HTTPException as exc:
+            last_error = exc
+            continue
+        if results:
+            return results
+    if last_error:
+        raise last_error
+    return []
 
 
 @app.post("/api/discover")

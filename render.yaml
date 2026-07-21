@@ -17,15 +17,16 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      # Enables automatic company discovery from a description. Set ONE of these
-      # in the Render dashboard (Environment). Priority: Tavily > SerpAPI > Brave.
+      # Enables automatic company discovery from a description. Set keys in the
+      # Render dashboard (Environment). Chain: SerpAPI first, Tavily as
+      # fallback, then Brave — automatic failover on errors/empty results.
       # Without any, the app still works for direct website extraction.
-      #   Tavily  (free 1k/mo):   https://tavily.com/
       #   SerpAPI (free 100/mo):  https://serpapi.com/
+      #   Tavily  (free 1k/mo):   https://tavily.com/
       #   Brave   (free ~2k/mo):  https://brave.com/search/api/
-      - key: TAVILY_API_KEY
-        sync: false
       - key: SERPAPI_KEY
+        sync: false
+      - key: TAVILY_API_KEY
         sync: false
       - key: BRAVE_API_KEY
         sync: false
