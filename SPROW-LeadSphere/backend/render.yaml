@@ -1,0 +1,29 @@
+# Render Blueprint — one-click deploy for SPROW LeadSphere Backend
+# 1. Push this repo to GitHub
+# 2. In Render dashboard: "New +" → "Blueprint" → connect repo
+# 3. Set the env vars below in Render's dashboard
+#
+# Frontend goes to Cloudflare Pages (separate deployment).
+# See ../DEPLOY.md for the full guide.
+
+services:
+  - type: web
+    name: sprow-leadsphere-api
+    runtime: docker
+    repo: https://github.com/Jizzi811/sprow-leadsphere
+    branch: main
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://sprow-leadsphere.pages.dev
+      - key: DATABASE_PATH
+        value: /var/data/leadsphere.db
+      - key: PORT
+        value: "8000"
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    healthCheckPath: /health
+    autoDeploy: true

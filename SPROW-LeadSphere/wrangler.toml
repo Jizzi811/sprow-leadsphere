@@ -1,0 +1,10 @@
+# Cloudflare Pages Konfiguration
+# Wird automatisch vom Pages Git-Integration erkannt.
+name = "sprow-leadsphere"
+compatibility_date = "2026-07-21"
+
+# Build-Einstellungen (für wrangler pages deploy)
+pages_build_output_dir = "./dist"
+
+[build]
+command = "npm run build"
