@@ -42,6 +42,24 @@ Save, then **Manual Deploy → Deploy latest commit**. (The old service pointed 
 `backend/Dockerfile`, which built the API only — that file has been removed in
 favour of the single monolithic Dockerfile.)
 
+## Automatic web discovery (Brave Search)
+
+Typing a **description** (e.g. "Hausverwaltungen in NRW") triggers
+`POST /api/discover`: it runs a Brave web search, picks the distinct company
+sites (skipping directories/social), and extracts contacts from each with
+Scrapling. Typing a **website** still extracts that single site directly.
+
+This needs a Brave Search API key:
+
+1. Get a free key at **https://brave.com/search/api/** (the free tier covers
+   ~2,000 queries/month).
+2. In Render → `sprow-leadsphere-api` → **Environment** → add
+   `BRAVE_API_KEY = <your key>` → save (triggers a redeploy).
+
+Without the key the app still works for direct website extraction; descriptions
+just return a clear "not configured" message. Optional: `DISCOVER_MAX_SITES`
+(default 8) caps how many sites are scraped per search.
+
 ## Data persistence
 
 SQLite lives inside the container and is **ephemeral on the free plan** — saved

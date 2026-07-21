@@ -16,6 +16,13 @@ services:
     plan: free
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      # Enables automatic company discovery from a description. Get a free key
+      # at https://brave.com/search/api/ and set the value in the Render
+      # dashboard (Environment). Without it, the app still works for direct
+      # website extraction; descriptions just return no results.
+      - key: BRAVE_API_KEY
+        sync: false
     # No ALLOWED_ORIGINS / VITE_API_URL needed: frontend and API share an origin.
     # SQLite inside the container is EPHEMERAL on the free plan (leads reset when
     # the instance restarts/sleeps). For durable storage switch to a paid plan

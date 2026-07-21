@@ -35,11 +35,19 @@ export async function checkHealth() {
   }
 }
 
-// ---- Extract ----
+// ---- Extract (single website) ----
 export async function extractUrl(url) {
   return request("/api/extract", {
     method: "POST",
     body: JSON.stringify({ url }),
+  });
+}
+
+// ---- Discover (description -> web search -> extraction) ----
+export async function discover(query, region = "", target = "") {
+  return request("/api/discover", {
+    method: "POST",
+    body: JSON.stringify({ query, region, target }),
   });
 }
 

@@ -150,6 +150,31 @@ export function App() {
     }
   }, [region, target]);
 
+  // ---- Discover companies from a description (web search -> extraction) ----
+  const runDiscovery = useCallback(async (q) => {
+    setLive(true);
+    setLeads([]);
+    setProgress(0);
+    setNotice("Durchsuche das Web nach passenden Firmen …");
+    try {
+      const data = await api.discover(q, region, target);
+      const found = data.leads || [];
+      setLeads(found);
+      const [s, l] = await Promise.all([api.listSearches(50, 0), api.listLeads(null, 200, 0)]);
+      setSearches(s);
+      setAllLeads(l);
+      setNotice(
+        found.length
+          ? `${found.length} Firmen im Web gefunden und geprüft.`
+          : "Keine passenden Firmen gefunden – formuliere die Suche etwas anders."
+      );
+    } catch (err) {
+      setNotice(`Web-Recherche fehlgeschlagen: ${err.message}`);
+    } finally {
+      setLive(false);
+    }
+  }, [region, target]);
+
   // ---- Submit search ----
   const startSearch = useCallback((e) => {
     e?.preventDefault();
@@ -159,17 +184,19 @@ export function App() {
       setNotice("Bitte beschreibe zuerst, wen LeadSphere finden soll.");
       return;
     }
-    // Check for URL in query
+    // A domain/URL -> extract that one site; a description -> discover via web search.
     const urlMatch = q.match(/((?:https?:\/\/)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?)/i);
-    if (hasBackend && urlMatch) {
-      runLiveExtraction(urlMatch[0]);
+    if (hasBackend) {
+      if (urlMatch) runLiveExtraction(urlMatch[0]);
+      else runDiscovery(q);
       return;
     }
+    // Offline demo mode (no backend detected).
     setNotice("");
     setLeads([]);
     setProgress(0);
     setSearching(true);
-  }, [query, hasBackend, runLiveExtraction]);
+  }, [query, hasBackend, runLiveExtraction, runDiscovery]);
 
   // ---- Delete search ----
   const handleDelete = useCallback(async (searchId) => {

@@ -8,10 +8,12 @@
 """
 import os
 import re
+import asyncio
 from ipaddress import ip_address
 from socket import getaddrinfo
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +39,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- Web discovery (Brave Search API) ----
+# Set BRAVE_API_KEY in the environment to enable automatic company discovery
+# from a plain description ("Hausverwaltungen in NRW"). Free key:
+# https://brave.com/search/api/
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+# Aggregators / directories / social — not the company sites we want to scrape.
+_SKIP_DOMAINS = {
+    "wikipedia.org", "facebook.com", "linkedin.com", "instagram.com", "youtube.com",
+    "xing.com", "twitter.com", "x.com", "amazon.de", "ebay.de", "kleinanzeigen.de",
+    "ebay-kleinanzeigen.de", "google.com", "yelp.com", "yelp.de", "pinterest.com",
+    "tiktok.com", "kununu.com", "indeed.com", "stepstone.de", "wlw.de", "11880.com",
+    "gelbeseiten.de", "dasoertliche.de", "meinestadt.de", "immobilienscout24.de",
+}
+_DISCOVER_MAX_SITES = int(os.getenv("DISCOVER_MAX_SITES", "8"))
 
 # ---- Pydantic models ----
 class ExtractRequest(BaseModel):
@@ -138,6 +156,91 @@ async def extract(payload: ExtractRequest):
         "text_preview": body_text[:500],
     }
     return result
+
+
+# ---- Discover (Brave search -> Scrapling extraction) ----
+async def _brave_search(query: str, count: int = 15) -> list[dict]:
+    if not BRAVE_API_KEY:
+        raise HTTPException(503, "Web-Suche ist nicht konfiguriert (BRAVE_API_KEY fehlt).")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                BRAVE_ENDPOINT,
+                params={"q": query, "count": count, "country": "de", "search_lang": "de"},
+                headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+    if resp.status_code == 429:
+        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Web-Suche fehlgeschlagen (Brave {resp.status_code}).")
+    return resp.json().get("web", {}).get("results", [])
+
+
+@app.post("/api/discover")
+async def discover(payload: SearchRequest):
+    query_text = " ".join(p for p in [payload.query, payload.region, payload.target] if p).strip()
+    results = await _brave_search(query_text, count=15)
+
+    # Pick distinct company sites, skipping directories / social / aggregators.
+    seen: set[str] = set()
+    candidates: list[tuple[str, str, str, str]] = []
+    for item in results:
+        url = item.get("url") or ""
+        host = (urlparse(url).hostname or "").replace("www.", "")
+        if not host or host in seen:
+            continue
+        if any(host == d or host.endswith("." + d) for d in _SKIP_DOMAINS):
+            continue
+        seen.add(host)
+        candidates.append((url, host, item.get("title", ""), item.get("description", "")))
+        if len(candidates) >= _DISCOVER_MAX_SITES:
+            break
+
+    search = await db.create_search(
+        query=payload.query, region=payload.region, target=payload.target, source_url=query_text
+    )
+
+    try:
+        from scrapling.fetchers import AsyncFetcher
+    except Exception:
+        AsyncFetcher = None
+
+    sem = asyncio.Semaphore(5)
+
+    async def _extract(url: str, host: str, title: str, desc: str) -> dict:
+        async with sem:
+            page = None
+            if AsyncFetcher is not None:
+                try:
+                    page = await AsyncFetcher.get(url, timeout=12)
+                except Exception:
+                    page = None
+            if page is None:
+                # Fall back to the Brave result metadata so the lead still shows up.
+                return {"company": (title or host)[:120], "city": "", "website": host,
+                        "email": "", "phone": "", "score": 25, "description": (desc or "")[:200]}
+            body = " ".join(page.css("body ::text").getall())[:8000]
+            emails = extract_emails(body)
+            phones = extract_phones(body)
+            page_title = page.css("title::text").get(default="") or title
+            return {
+                "company": (page_title or host)[:120],
+                "city": "",
+                "website": host,
+                "email": emails[0] if emails else "",
+                "phone": phones[0] if phones else "",
+                "score": min(99, 40 + len(emails) * 15 + len(phones) * 10),
+                "description": (desc or "")[:200],
+            }
+
+    leads = list(await asyncio.gather(*[_extract(*c) for c in candidates])) if candidates else []
+    leads.sort(key=lambda item: item["score"], reverse=True)
+    if leads:
+        await db.insert_leads(search["id"], leads)
+    await db.finish_search(search["id"], len(leads))
+    return {"search": search, "leads": leads}
 
 
 # ---- Searches ----
