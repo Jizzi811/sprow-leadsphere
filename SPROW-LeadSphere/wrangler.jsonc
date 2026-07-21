@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Muss exakt dem Worker-Namen im Cloudflare-Dashboard entsprechen,
+  // sonst schlägt der Git-Build fehl. (Eigener Name — NICHT energieteam-sprow,
+  // das ist der andere Worker.)
+  "name": "sprow-leadsphere",
+  "compatibility_date": "2026-07-21",
+  // Reiner Static-Asset-Worker: kein "main"/kein Worker-Skript, deshalb
+  // auch kein "binding". Cloudflare liefert den Vite-Build aus ./dist aus.
+  "assets": {
+    "directory": "./dist",
+    // SPA-Routing: unbekannte Pfade liefern index.html (Status 200).
+    "not_found_handling": "single-page-application"
+  }
+}
