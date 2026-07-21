@@ -233,22 +233,6 @@ export function App() {
     setActive(view);
   }, []);
 
-  // ---- Refresh backends ----
-  const refreshBackend = useCallback(async () => {
-    try {
-      setLeadsLoading(true);
-      setHistoryLoading(true);
-      const [s, l] = await Promise.all([api.listSearches(50, 0), api.listLeads(null, 200, 0)]);
-      setSearches(s);
-      setAllLeads(l);
-    } catch {
-      // ignore
-    } finally {
-      setLeadsLoading(false);
-      setHistoryLoading(false);
-    }
-  }, []);
-
   // ---- CSV Export ----
   const exportCsv = useCallback(() => {
     const data = leads.length ? leads : api.DEMO_LEADS;
@@ -383,12 +367,7 @@ export function App() {
         ) : (
           renderView()
         )}
-        {hasBackend && (
-          <p className="live-hint" style={{ marginTop: 24 }}>
-            Live-Backend aktiv · <a href="#" onClick={(e) => { e.preventDefault(); refreshBackend(); }}>Daten aktualisieren</a>
-          </p>
-        )}
-        <footer>Öffentliche Quellen · Datenschutzfreundliche Recherche · Quellen werden dokumentiert</footer>
+        <footer><b>LeadSphere</b> · powered by nadj.ai · Öffentliche Quellen · Datenschutzfreundliche Recherche</footer>
       </main>
       <Toast toast={toast} onClose={closeToast} />
     </div>

@@ -85,13 +85,6 @@ export function SearchPanel({
         )}
       </form>
 
-      {hasBackend && (
-        <p className="live-hint">
-          Live-Modus aktiv · Gib eine Firmen-Website ein (z.&nbsp;B.{" "}
-          <b>example.de</b>), um echte Kontaktdaten zu extrahieren.
-        </p>
-      )}
-
       {notice && (
         <div className={`notice ${notice.includes("fehlgeschlagen") ? "error" : ""}`}>
           <Sparkle weight="fill" />

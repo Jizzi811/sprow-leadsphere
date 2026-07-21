@@ -12,7 +12,7 @@ export function Sidebar({ active, setActive, stats }) {
     <aside className="sidebar">
       <div className="brand">
         <SolarPanel weight="duotone" />
-        <span>EnergyTeam <b>Sprow</b></span>
+        <span><b>LeadSphere</b><small className="brand-sub">powered by nadj.ai</small></span>
       </div>
       <nav>
         {NAV_ITEMS.map(({ key, icon: Icon }) => (

@@ -63,6 +63,8 @@ a { color: inherit; }
 }
 .brand svg { font-size: 26px; }
 .brand b { color: #f3f2ed; }
+.brand span { display: grid; gap: 2px; line-height: 1.1; }
+.brand-sub { font-size: 9.5px; color: #7f8984; letter-spacing: 0.05em; }
 
 .sidebar nav {
   display: flex;
