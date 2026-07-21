@@ -1,18 +1,30 @@
-# Render blueprint for the SPROW LeadSphere Scrapling API.
-# In Render: New + -> Blueprint -> pick this repo. After the first deploy,
-# set ALLOWED_ORIGINS to your Cloudflare frontend URL under the service's
-# Environment tab, then redeploy.
+# Render blueprint for SPROW LeadSphere — a single monolithic web service that
+# serves BOTH the built frontend and the FastAPI + Scrapling API on one origin.
+#
+# In Render: New + -> Blueprint -> pick this repo -> Apply.
+# (If a previous, broken "sprow-leadsphere-api" service exists, delete it first
+#  or let the blueprint update it in place — same name.)
 services:
   - type: web
     name: sprow-leadsphere-api
     runtime: docker
-    dockerfilePath: ./SPROW-LeadSphere/backend/Dockerfile
-    dockerContext: ./SPROW-LeadSphere/backend
+    repo: https://github.com/Jizzi811/sprow-leadsphere
+    branch: main
+    # Build context is the app folder so the Dockerfile can build the frontend
+    # (src/) and install the backend (backend/) in one multi-stage image.
+    rootDir: SPROW-LeadSphere
+    dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
     autoDeploy: true
-    envVars:
-      # Comma-separated list of allowed frontend origins. Leave unset here and
-      # fill it in the dashboard once the Cloudflare URL is known.
-      - key: ALLOWED_ORIGINS
-        sync: false
+    # No ALLOWED_ORIGINS / VITE_API_URL needed: frontend and API share an origin.
+    # SQLite lives inside the container and is EPHEMERAL on the free plan (leads
+    # reset when the instance restarts/sleeps). For durable storage, switch to a
+    # paid plan with a disk (uncomment below) or an external DB (e.g. Supabase).
+    # envVars:
+    #   - key: DATABASE_PATH
+    #     value: /var/data/leadsphere.db
+    # disk:
+    #   name: data
+    #   mountPath: /var/data
+    #   sizeGB: 1

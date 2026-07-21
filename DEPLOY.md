@@ -1,94 +1,80 @@
-# Deployment — SPROW LeadSphere
+# Deployment — SPROW LeadSphere (single Render service)
 
-Two parts that deploy to **different** hosts:
-
-- **Frontend** (Vite + React SPA in `SPROW-LeadSphere/`) → **Cloudflare Workers**
-  (static assets)
-- **Backend** (FastAPI + Scrapling in `SPROW-LeadSphere/backend/`) → **Render**
-  (Docker) — Cloudflare cannot run Python/Scrapling.
-
-Deploy order matters because of the two-way link (frontend needs the API URL at
-build time; backend needs the frontend origin for CORS):
+SPROW LeadSphere deploys as **one monolithic Render web service** that serves
+both the built React/Vite frontend and the FastAPI + Scrapling API on the same
+origin. No Cloudflare, no CORS, no `VITE_API_URL` — the frontend calls the API
+with relative paths, which the same service answers.
 
 ```
-1) Backend on Render  ->  2) Frontend on Cloudflare  ->  3) CORS back on Render
+Browser ──HTTPS──▶  Render web service (Docker)
+                      ├─ /            → built SPA (StaticFiles)
+                      ├─ /assets/*    → JS/CSS
+                      ├─ /health      → health check
+                      └─ /api/*       → FastAPI + Scrapling + SQLite
 ```
 
-Until `VITE_API_URL` is set, the frontend stays in **demo mode** (fictional
-sample leads) — which is safe to publish on its own.
+The multi-stage `SPROW-LeadSphere/Dockerfile` builds the frontend (Node stage)
+and copies it into the Python image, where `app.py` mounts it at `/`.
 
-## 1. Backend on Render
+## Deploy (fresh, via Blueprint)
 
-Render → **New + → Blueprint** → pick this repo. The root `render.yaml` defines
-a Docker web service (`sprow-leadsphere-api`, health check `/health`) built from
-`SPROW-LeadSphere/backend/Dockerfile`.
+1. In Render: **New + → Blueprint → connect `Jizzi811/sprow-leadsphere` → Apply.**
+   The root `render.yaml` defines the service (`sprow-leadsphere-api`, Docker,
+   root directory `SPROW-LeadSphere`, health check `/health`, free plan).
+2. Wait for the build (Node build + `scrapling[all]` install take a few minutes).
+3. Open the service URL — the SPROW LeadSphere app loads and live research works
+   immediately (the frontend auto-detects the same-origin backend via `/health`).
 
-After the first deploy you get a URL like
-`https://sprow-leadsphere-api.onrender.com`. Test it:
+## Fixing an EXISTING service that shows 404 at `/`
 
-```bash
-curl https://sprow-leadsphere-api.onrender.com/health   # {"status":"ok",...}
-```
+If a `sprow-leadsphere-api` service already exists but only `/health` works
+(the frontend was not in the image), update its build settings so it uses the
+monolithic Dockerfile:
 
-> The `free` plan sleeps after inactivity (first request is slow) and gives
-> 512 MB RAM. Bump the plan in `render.yaml` if you need it always-on.
+**Render → sprow-leadsphere-api → Settings → Build & Deploy:**
 
-## 2. Frontend on Cloudflare
+| Setting         | Value                |
+| --------------- | -------------------- |
+| Root Directory  | `SPROW-LeadSphere`   |
+| Dockerfile Path | `./Dockerfile`       |
 
-Cloudflare → **Workers & Pages → Create → Import a repository** → this repo.
+Save, then **Manual Deploy → Deploy latest commit**. (The old service pointed at
+`backend/Dockerfile`, which built the API only — that file has been removed in
+favour of the single monolithic Dockerfile.)
 
-| Setting                | Value                     |
-| ---------------------- | ------------------------- |
-| Root directory         | `SPROW-LeadSphere`        |
-| Build command          | `npm run build`           |
-| Deploy command         | `npx wrangler deploy`     |
-| Build variable         | `VITE_API_URL` = your Render URL |
+## Data persistence
 
-`VITE_API_URL` is inlined by Vite **at build time**, so it must be set as a
-build variable *before* the build. Deploy → you get a
-`https://sprow-leadsphere.<subdomain>.workers.dev` URL.
+SQLite lives inside the container and is **ephemeral on the free plan** — saved
+searches/leads reset when the instance restarts or wakes from sleep, and the
+free instance spins down after inactivity (first request can take ~50 s).
 
-`wrangler.jsonc` serves `dist/` with SPA routing (`not_found_handling:
-single-page-application`).
-
-## 3. CORS back on Render
-
-On the Render service → **Environment** → set:
-
-```
-ALLOWED_ORIGINS = https://sprow-leadsphere.<subdomain>.workers.dev
-```
-
-(Comma-separate multiple origins.) Redeploy the backend.
-
-## 4. Verify live research
-
-Open the Cloudflare URL. With `VITE_API_URL` set, a **“Live-Modus aktiv”** hint
-appears. Enter a company website (e.g. `example.de`) and start the search —
-real title / e-mail / phone are extracted via Scrapling. Without a URL (or
-without `VITE_API_URL`), the polished demo flow runs unchanged.
+For durable storage, either:
+- switch to a paid plan and attach a disk (uncomment the `disk` + `DATABASE_PATH`
+  block in `render.yaml`), or
+- move the DB layer in `backend/database.py` to an external DB (e.g. Supabase/
+  Postgres) — it is isolated behind a small async interface for this reason.
 
 ## Local development
 
 ```bash
-# Frontend
-cd SPROW-LeadSphere && npm install && npm run dev
-
-# Backend
+# Backend (terminal 1)
 cd SPROW-LeadSphere/backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app:app --reload --port 8000
+
+# Frontend (terminal 2) — talks to the backend via VITE_API_URL
+cd SPROW-LeadSphere
+npm install
+echo "VITE_API_URL=http://localhost:8000" > .env
+npm run dev
 ```
 
-Point the frontend at the local API with `SPROW-LeadSphere/.env`:
-
-```
-VITE_API_URL=http://localhost:8000
-```
+In production the frontend is served by the backend, so `VITE_API_URL` stays
+empty and all calls are same-origin.
 
 ## Legal / safety note
 
-The backend only accepts public http(s) URLs and blocks private/local network
-targets. Collect only public business information and respect applicable law,
-site terms and robots rules.
+The `/api/extract` endpoint only accepts public http(s) URLs and blocks
+private/local network targets. Collect only public business information and
+respect applicable law, site terms and robots rules.
