@@ -17,11 +17,15 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
-      # Enables automatic company discovery from a description. Get a free key
-      # at https://brave.com/search/api/ and set the value in the Render
-      # dashboard (Environment). Without it, the app still works for direct
-      # website extraction; descriptions just return no results.
+      # Enables automatic company discovery from a description. Set ONE of these
+      # in the Render dashboard (Environment). SerpAPI (Google) takes priority if
+      # both are set. Without either, the app still works for direct website
+      # extraction; descriptions just return no results.
+      #   Brave   (free ~2k/mo):  https://brave.com/search/api/
+      #   SerpAPI (free 100/mo):  https://serpapi.com/
       - key: BRAVE_API_KEY
+        sync: false
+      - key: SERPAPI_KEY
         sync: false
     # No ALLOWED_ORIGINS / VITE_API_URL needed: frontend and API share an origin.
     # SQLite inside the container is EPHEMERAL on the free plan (leads reset when

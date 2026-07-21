@@ -42,23 +42,26 @@ Save, then **Manual Deploy → Deploy latest commit**. (The old service pointed 
 `backend/Dockerfile`, which built the API only — that file has been removed in
 favour of the single monolithic Dockerfile.)
 
-## Automatic web discovery (Brave Search)
+## Automatic web discovery (Brave Search or SerpAPI)
 
 Typing a **description** (e.g. "Hausverwaltungen in NRW") triggers
-`POST /api/discover`: it runs a Brave web search, picks the distinct company
-sites (skipping directories/social), and extracts contacts from each with
-Scrapling. Typing a **website** still extracts that single site directly.
+`POST /api/discover`: it runs a web search, picks the distinct company sites
+(skipping directories/social), and extracts contacts from each with Scrapling.
+Typing a **website** still extracts that single site directly.
 
-This needs a Brave Search API key:
+This needs **one** search-provider API key. Set it in
+Render → `sprow-leadsphere-api` → **Environment** → *Add Environment Variable*
+(save triggers a redeploy):
 
-1. Get a free key at **https://brave.com/search/api/** (the free tier covers
-   ~2,000 queries/month).
-2. In Render → `sprow-leadsphere-api` → **Environment** → add
-   `BRAVE_API_KEY = <your key>` → save (triggers a redeploy).
+| Provider | Env var | Free key |
+| -------- | ------- | -------- |
+| Brave (default) | `BRAVE_API_KEY` | https://brave.com/search/api/ (~2,000/mo) |
+| SerpAPI (Google) | `SERPAPI_KEY` | https://serpapi.com/ (100/mo) |
 
-Without the key the app still works for direct website extraction; descriptions
-just return a clear "not configured" message. Optional: `DISCOVER_MAX_SITES`
-(default 8) caps how many sites are scraped per search.
+If both are set, **SerpAPI takes priority**. Without either, the app still works
+for direct website extraction; descriptions just return a clear "not configured"
+message. Optional: `DISCOVER_MAX_SITES` (default 8) caps how many sites are
+scraped per search.
 
 ## Data persistence
 

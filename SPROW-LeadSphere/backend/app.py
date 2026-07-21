@@ -46,6 +46,9 @@ app.add_middleware(
 # https://brave.com/search/api/
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+# Alternative provider — set SERPAPI_KEY to use Google via SerpAPI instead.
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 # Aggregators / directories / social — not the company sites we want to scrape.
 _SKIP_DOMAINS = {
     "wikipedia.org", "facebook.com", "linkedin.com", "instagram.com", "youtube.com",
@@ -158,10 +161,9 @@ async def extract(payload: ExtractRequest):
     return result
 
 
-# ---- Discover (Brave search -> Scrapling extraction) ----
+# ---- Discover (web search -> Scrapling extraction) ----
+# Each provider returns a normalized list of {url, title, description}.
 async def _brave_search(query: str, count: int = 15) -> list[dict]:
-    if not BRAVE_API_KEY:
-        raise HTTPException(503, "Web-Suche ist nicht konfiguriert (BRAVE_API_KEY fehlt).")
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -175,13 +177,47 @@ async def _brave_search(query: str, count: int = 15) -> list[dict]:
         raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
     if resp.status_code != 200:
         raise HTTPException(502, f"Web-Suche fehlgeschlagen (Brave {resp.status_code}).")
-    return resp.json().get("web", {}).get("results", [])
+    return [
+        {"url": r.get("url", ""), "title": r.get("title", ""), "description": r.get("description", "")}
+        for r in resp.json().get("web", {}).get("results", [])
+    ]
+
+
+async def _serpapi_search(query: str, count: int = 15) -> list[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                SERPAPI_ENDPOINT,
+                params={"engine": "google", "q": query, "num": count,
+                        "gl": "de", "hl": "de", "api_key": SERPAPI_KEY},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+    if resp.status_code == 429:
+        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Web-Suche fehlgeschlagen (SerpAPI {resp.status_code}).")
+    return [
+        {"url": r.get("link", ""), "title": r.get("title", ""), "description": r.get("snippet", "")}
+        for r in resp.json().get("organic_results", [])
+    ]
+
+
+async def _web_search(query: str, count: int = 15) -> list[dict]:
+    """Dispatch to the configured provider (SerpAPI preferred if both set)."""
+    if SERPAPI_KEY:
+        return await _serpapi_search(query, count)
+    if BRAVE_API_KEY:
+        return await _brave_search(query, count)
+    raise HTTPException(
+        503, "Web-Suche ist nicht konfiguriert (setze SERPAPI_KEY oder BRAVE_API_KEY)."
+    )
 
 
 @app.post("/api/discover")
 async def discover(payload: SearchRequest):
     query_text = " ".join(p for p in [payload.query, payload.region, payload.target] if p).strip()
-    results = await _brave_search(query_text, count=15)
+    results = await _web_search(query_text, count=15)
 
     # Pick distinct company sites, skipping directories / social / aggregators.
     seen: set[str] = set()
