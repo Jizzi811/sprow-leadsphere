@@ -155,7 +155,7 @@ export function App() {
     setLive(true);
     setLeads([]);
     setProgress(0);
-    setNotice("Durchsuche das Web nach passenden Firmen …");
+    setNotice("Durchsuche das Web nach passenden Firmen … (kann bis zu einer Minute dauern)");
     try {
       const data = await api.discover(q, region, target);
       const found = data.leads || [];

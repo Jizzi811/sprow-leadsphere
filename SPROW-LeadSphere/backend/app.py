@@ -57,7 +57,13 @@ _SKIP_DOMAINS = {
     "tiktok.com", "kununu.com", "indeed.com", "stepstone.de", "wlw.de", "11880.com",
     "gelbeseiten.de", "dasoertliche.de", "meinestadt.de", "immobilienscout24.de",
 }
-_DISCOVER_MAX_SITES = int(os.getenv("DISCOVER_MAX_SITES", "8"))
+# How many company sites to scrape per search (final result cap).
+_DISCOVER_MAX_SITES = int(os.getenv("DISCOVER_MAX_SITES", "30"))
+# Raw search results to gather (before de-dup/skip) — fetched via pagination.
+_SEARCH_FETCH = min(max(_DISCOVER_MAX_SITES * 2, 40), 90)
+# Parallel scrapes and per-site timeout (seconds) — keeps total time bounded.
+_DISCOVER_CONCURRENCY = int(os.getenv("DISCOVER_CONCURRENCY", "10"))
+_DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT", "10"))
 
 # ---- Pydantic models ----
 class ExtractRequest(BaseModel):
@@ -163,32 +169,51 @@ async def extract(payload: ExtractRequest):
 
 # ---- Discover (web search -> Scrapling extraction) ----
 # Each provider returns a normalized list of {url, title, description}.
-async def _brave_search(query: str, count: int = 15) -> list[dict]:
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                BRAVE_ENDPOINT,
-                params={"q": query, "count": count, "country": "de", "search_lang": "de"},
-                headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+async def _brave_search(query: str, want: int) -> list[dict]:
+    # Brave caps count at 20/page; paginate via offset (max ~9) to gather more.
+    per_page = 20
+    pages = min(-(-want // per_page), 10)
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for offset in range(pages):
+            if offset:
+                await asyncio.sleep(1)  # Brave free tier ~1 request/sec
+            try:
+                resp = await client.get(
+                    BRAVE_ENDPOINT,
+                    params={"q": query, "count": per_page, "offset": offset,
+                            "country": "de", "search_lang": "de"},
+                    headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+                )
+            except Exception as exc:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+            if resp.status_code == 429:
+                if out:
+                    break
+                raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+            if resp.status_code != 200:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche fehlgeschlagen (Brave {resp.status_code}).")
+            batch = resp.json().get("web", {}).get("results", [])
+            out.extend(
+                {"url": r.get("url", ""), "title": r.get("title", ""), "description": r.get("description", "")}
+                for r in batch
             )
-    except Exception as exc:
-        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
-    if resp.status_code == 429:
-        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
-    if resp.status_code != 200:
-        raise HTTPException(502, f"Web-Suche fehlgeschlagen (Brave {resp.status_code}).")
-    return [
-        {"url": r.get("url", ""), "title": r.get("title", ""), "description": r.get("description", "")}
-        for r in resp.json().get("web", {}).get("results", [])
-    ]
+            if len(batch) < per_page or len(out) >= want:
+                break
+    return out
 
 
-async def _serpapi_search(query: str, count: int = 15) -> list[dict]:
+async def _serpapi_search(query: str, want: int) -> list[dict]:
+    # Google via SerpAPI returns up to ~100 results in a single request.
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=25) as client:
             resp = await client.get(
                 SERPAPI_ENDPOINT,
-                params={"engine": "google", "q": query, "num": count,
+                params={"engine": "google", "q": query, "num": min(want, 100),
                         "gl": "de", "hl": "de", "api_key": SERPAPI_KEY},
             )
     except Exception as exc:
@@ -203,12 +228,12 @@ async def _serpapi_search(query: str, count: int = 15) -> list[dict]:
     ]
 
 
-async def _web_search(query: str, count: int = 15) -> list[dict]:
+async def _web_search(query: str, want: int) -> list[dict]:
     """Dispatch to the configured provider (SerpAPI preferred if both set)."""
     if SERPAPI_KEY:
-        return await _serpapi_search(query, count)
+        return await _serpapi_search(query, want)
     if BRAVE_API_KEY:
-        return await _brave_search(query, count)
+        return await _brave_search(query, want)
     raise HTTPException(
         503, "Web-Suche ist nicht konfiguriert (setze SERPAPI_KEY oder BRAVE_API_KEY)."
     )
@@ -217,7 +242,7 @@ async def _web_search(query: str, count: int = 15) -> list[dict]:
 @app.post("/api/discover")
 async def discover(payload: SearchRequest):
     query_text = " ".join(p for p in [payload.query, payload.region, payload.target] if p).strip()
-    results = await _web_search(query_text, count=15)
+    results = await _web_search(query_text, want=_SEARCH_FETCH)
 
     # Pick distinct company sites, skipping directories / social / aggregators.
     seen: set[str] = set()
@@ -243,14 +268,14 @@ async def discover(payload: SearchRequest):
     except Exception:
         AsyncFetcher = None
 
-    sem = asyncio.Semaphore(5)
+    sem = asyncio.Semaphore(_DISCOVER_CONCURRENCY)
 
     async def _extract(url: str, host: str, title: str, desc: str) -> dict:
         async with sem:
             page = None
             if AsyncFetcher is not None:
                 try:
-                    page = await AsyncFetcher.get(url, timeout=12)
+                    page = await AsyncFetcher.get(url, timeout=_DISCOVER_TIMEOUT)
                 except Exception:
                     page = None
             if page is None:
