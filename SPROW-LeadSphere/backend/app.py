@@ -353,17 +353,22 @@ async def discover(payload: SearchRequest):
 
     seen: set[str] = set()
     candidates: list[tuple[str, str, str, str]] = []
+    skipped = {"duplicate": 0, "social": 0, "directory": 0, "known": 0}
     for item in results:
         url = item.get("url") or ""
         host = (urlparse(url).hostname or "").replace("www.", "")
         key = url if payload.include_directories else host
         if not host or key in seen:
+            skipped["duplicate"] += 1
             continue
         if _in(host, _ALWAYS_SKIP_DOMAINS):
+            skipped["social"] += 1
             continue
         if not payload.include_directories and _in(host, _DIRECTORY_DOMAINS):
+            skipped["directory"] += 1
             continue
         if host in known:
+            skipped["known"] += 1
             continue
         seen.add(key)
         candidates.append((url, host, item.get("title", ""), item.get("description", "")))
@@ -414,7 +419,18 @@ async def discover(payload: SearchRequest):
     await db.finish_search(search["id"], len(leads))
     # "exhausted": es gab Treffer, aber alle waren schon bekannt (Dubletten).
     exhausted = bool(results) and not candidates and bool(known)
-    return {"search": search, "leads": leads, "exhausted": exhausted}
+    return {
+        "search": search,
+        "leads": leads,
+        "exhausted": exhausted,
+        "debug": {
+            "raw_hits": len(results),
+            "skipped_duplicate": skipped["duplicate"],
+            "skipped_social": skipped["social"],
+            "skipped_directory": skipped["directory"],
+            "skipped_known": skipped["known"],
+        },
+    }
 
 
 # ---- Searches ----
