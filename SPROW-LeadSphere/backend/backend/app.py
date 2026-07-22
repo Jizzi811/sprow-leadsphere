@@ -1,0 +1,558 @@
+"""SPROW LeadSphere API — Full production-ready backend.
+
+- /api/extract   – Scrapling-based public URL extraction
+- /api/searches  – Search history CRUD (SQLite)
+- /api/leads     – Lead results per search
+- /api/stats     – Dashboard statistics
+- /api/feedback  – User feedback on search quality
+"""
+import os
+import re
+import asyncio
+from ipaddress import ip_address
+from socket import getaddrinfo
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, HttpUrl, Field
+
+import sys; sys.path.insert(0, os.path.dirname(__file__))
+import db_router as db
+
+app = FastAPI(title="SPROW LeadSphere API", version="1.0.0")
+
+# ---- CORS ----
+# In production, set ALLOWED_ORIGINS to your Cloudflare Pages domain, e.g.:
+#   ALLOWED_ORIGINS=https://sprow-leadsphere.pages.dev
+_DEFAULT_ORIGINS = "http://localhost:4173,http://localhost:5173,https://*.onrender.com,https://*.pages.dev"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Web discovery (Brave Search API) ----
+# Set BRAVE_API_KEY in the environment to enable automatic company discovery
+# from a plain description ("Hausverwaltungen in NRW"). Free key:
+# https://brave.com/search/api/
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+# Alternative provider — set SERPAPI_KEY to use Google via SerpAPI instead.
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+# Alternative provider — Tavily (AI search). Takes priority if set.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+TAVILY_ENDPOINT = "https://api.tavily.com/search"
+# Social/aggregator noise — never useful as a lead source.
+_ALWAYS_SKIP_DOMAINS = {
+    "wikipedia.org", "facebook.com", "linkedin.com", "instagram.com", "youtube.com",
+    "xing.com", "twitter.com", "x.com", "amazon.de", "ebay.de", "google.com",
+    "pinterest.com", "tiktok.com", "kununu.com", "indeed.com", "stepstone.de",
+    "immobilienscout24.de",
+}
+# Business directories — skipped by default, but the "companies without a
+# website" vertical searches exactly these (listings carry phone numbers).
+_DIRECTORY_DOMAINS = {
+    "wlw.de", "11880.com", "gelbeseiten.de", "dasoertliche.de", "meinestadt.de",
+    "yelp.com", "yelp.de", "kleinanzeigen.de", "ebay-kleinanzeigen.de",
+    "branchenbuch.de", "cylex.de", "golocal.de", "werliefertwas.de",
+}
+# How many company sites to scrape per search (final result cap).
+# Target: 30-40 leads per search. Configurable via env if needed.
+_DISCOVER_MAX_SITES = int(os.getenv("DISCOVER_MAX_SITES", "35"))
+# Raw search results to gather (before de-dup/skip) — fetched via pagination.
+# NOTE on cost: SerpAPI charges ~1 credit per 10 results (1 page). Free
+# trials are typically ~100 credits *total*, not monthly — so don't go
+# overboard here. This gives enough buffer to survive directory/social
+# filtering without burning the whole quota on a single search.
+_SEARCH_FETCH = min(max(_DISCOVER_MAX_SITES * 2, 50), 100)
+# Parallel scrapes and per-site timeout (seconds) — keeps total time bounded.
+_DISCOVER_CONCURRENCY = int(os.getenv("DISCOVER_CONCURRENCY", "10"))
+_DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT", "10"))
+
+# ---- Pydantic models ----
+class ExtractRequest(BaseModel):
+    url: HttpUrl
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(default="", max_length=500)
+    region: str = ""
+    target: str = ""
+    keywords: list[str] = Field(default_factory=list, max_length=25)
+    # "Firmen ohne Webseite": search directory listings instead of company sites.
+    include_directories: bool = False
+    # Bereits gefundene Firmen bei Wiederholung ausblenden.
+    exclude_known: bool = True
+
+
+class FeedbackCreate(BaseModel):
+    search_id: str = Field(min_length=1)
+    rating: int = Field(ge=1, le=5)
+    comment: str = ""
+
+
+class LeadsBatch(BaseModel):
+    search_id: str = Field(min_length=1)
+    leads: list[dict] = Field(default_factory=list, max_length=50)
+
+
+class SearchUpdate(BaseModel):
+    status: str | None = None
+    result_count: int | None = None
+
+
+# ---- Security ----
+def assert_public_url(raw_url: str) -> None:
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(400, "Nur öffentliche HTTP(S)-Adressen sind erlaubt.")
+    try:
+        addresses = {item[4][0] for item in getaddrinfo(parsed.hostname, None)}
+    except OSError as exc:
+        raise HTTPException(400, "Domain konnte nicht aufgelöst werden.") from exc
+    for address in addresses:
+        ip = ip_address(address)
+        if not ip.is_global:
+            raise HTTPException(400, "Lokale oder private Netzwerkziele sind gesperrt.")
+
+
+def extract_emails(text: str) -> list[str]:
+    return sorted(set(
+        m.group(0).lower()
+        for m in re.finditer(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I)
+        if not m.group(0).lower().endswith((".png", ".jpg", ".gif", ".css", ".js"))
+    ))[:20]
+
+
+def extract_phones(text: str) -> list[str]:
+    return sorted(set(
+        m.group(0).strip()
+        for m in re.finditer(r"(?:\+49|0)[\d\s()/.-]{7,}", text)
+    ))[:20]
+
+
+# ---- Health ----
+@app.get("/health")
+async def health():
+    return {"status": "ok", "engine": "scrapling", "version": "1.0.0",
+            "db": db.BACKEND_NAME,
+            "db_path": _DB_PATH if (_DB_PATH := os.getenv("DATABASE_PATH", "leadsphere.db")) else ":memory:",
+            "search_providers": {
+                "serpapi": bool(SERPAPI_KEY),
+                "tavily": bool(TAVILY_API_KEY),
+                "brave": bool(BRAVE_API_KEY),
+            },
+            "origins": ALLOWED_ORIGINS}
+
+
+# ---- Extract ----
+@app.post("/api/extract")
+async def extract(payload: ExtractRequest):
+    url = str(payload.url)
+    assert_public_url(url)
+    try:
+        from scrapling.fetchers import AsyncFetcher
+    except Exception as exc:
+        raise HTTPException(503, "Scrapling ist auf dem Server nicht verfügbar.") from exc
+
+    try:
+        page = await AsyncFetcher.get(url, timeout=25)
+    except Exception as exc:
+        raise HTTPException(502, f"Zielseite konnte nicht geladen werden: {exc}") from exc
+
+    title = page.css("title::text").get(default="")
+    desc = page.css('meta[name="description"]::attr(content)').get(default="")
+    body_text = " ".join(page.css("body ::text").getall())[:8000]
+    emails = extract_emails(body_text)
+    phones = extract_phones(body_text)
+
+    # Extract company from title or domain
+    domain = urlparse(url).hostname or ""
+    company = title or domain.replace("www.", "").split(".")[0].capitalize()
+
+    result = {
+        "url": url,
+        "title": title,
+        "description": desc,
+        "company": company,
+        "emails": emails,
+        "phones": phones,
+        "text_preview": body_text[:500],
+    }
+    return result
+
+
+# ---- Discover (web search -> Scrapling extraction) ----
+# Each provider returns a normalized list of {url, title, description}.
+async def _brave_search(query: str, want: int) -> list[dict]:
+    # Brave caps count at 20/page; paginate via offset (max ~9) to gather more.
+    per_page = 20
+    pages = min(-(-want // per_page), 10)
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for offset in range(pages):
+            if offset:
+                await asyncio.sleep(1)  # Brave free tier ~1 request/sec
+            try:
+                resp = await client.get(
+                    BRAVE_ENDPOINT,
+                    params={"q": query, "count": per_page, "offset": offset,
+                            "country": "de", "search_lang": "de"},
+                    headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+                )
+            except Exception as exc:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+            if resp.status_code == 429:
+                if out:
+                    break
+                raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+            if resp.status_code != 200:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche fehlgeschlagen (Brave {resp.status_code}).")
+            batch = resp.json().get("web", {}).get("results", [])
+            out.extend(
+                {"url": r.get("url", ""), "title": r.get("title", ""), "description": r.get("description", "")}
+                for r in batch
+            )
+            if len(batch) < per_page or len(out) >= want:
+                break
+    return out
+
+
+async def _serpapi_search(query: str, want: int) -> list[dict]:
+    # Google returns ~10 organic results per page; paginate via `start` to
+    # gather more. NOTE: each page counts as one SerpAPI search credit.
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=25) as client:
+        for start in range(0, want, 10):
+            try:
+                resp = await client.get(
+                    SERPAPI_ENDPOINT,
+                    params={"engine": "google", "q": query, "start": start, "num": 10,
+                            "gl": "de", "hl": "de", "api_key": SERPAPI_KEY},
+                )
+            except Exception as exc:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+            if resp.status_code == 429:
+                if out:
+                    break
+                raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+            if resp.status_code != 200:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche fehlgeschlagen (SerpAPI {resp.status_code}).")
+            batch = resp.json().get("organic_results", [])
+            out.extend(
+                {"url": r.get("link", ""), "title": r.get("title", ""), "description": r.get("snippet", "")}
+                for r in batch
+            )
+            if len(batch) < 8 or len(out) >= want:
+                break
+    return out
+
+
+async def _tavily_search(query: str, want: int) -> list[dict]:
+    # Tavily caps max_results at 20 per request.
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                TAVILY_ENDPOINT,
+                headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+                json={"query": query, "max_results": min(want, 20),
+                      "search_depth": "basic", "country": "germany"},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+    if resp.status_code == 429:
+        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+    if resp.status_code in (401, 403):
+        raise HTTPException(502, "Web-Suche fehlgeschlagen: Tavily-API-Key ungültig.")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Web-Suche fehlgeschlagen (Tavily {resp.status_code}).")
+    return [
+        {"url": r.get("url", ""), "title": r.get("title", ""),
+         "description": (r.get("content", "") or "")[:300]}
+        for r in resp.json().get("results", [])
+    ]
+
+
+async def _web_search(query: str, want: int) -> list[dict]:
+    """Kombiniert alle konfigurierten Provider (SerpAPI, Tavily, Brave).
+
+    Wichtig: bricht NICHT beim ersten erfolgreichen Provider ab. Jeder
+    einzelne Provider ist auf eine bestimmte Trefferzahl gedeckelt (Tavily
+    z. B. auf 20 pro Aufruf) — wer nur einen Key gesetzt hat, bekommt sonst
+    systematisch zu wenige Rohtreffer, und nach dem Herausfiltern von
+    Social-/Verzeichnis-Domains und bereits bekannten Firmen bleibt am Ende
+    nur eine Handvoll übrig. Stattdessen werden alle Provider nacheinander
+    abgefragt und die Ergebnisse (dedupliziert nach URL) zusammengeführt,
+    bis "want" erreicht ist oder alle Provider ausgeschöpft sind.
+    """
+    providers = []
+    if SERPAPI_KEY:
+        providers.append(_serpapi_search)
+    if TAVILY_API_KEY:
+        providers.append(_tavily_search)
+    if BRAVE_API_KEY:
+        providers.append(_brave_search)
+    if not providers:
+        raise HTTPException(
+            503,
+            "Web-Suche ist nicht konfiguriert (setze SERPAPI_KEY, TAVILY_API_KEY oder BRAVE_API_KEY).",
+        )
+    last_error: HTTPException | None = None
+    seen_urls: set[str] = set()
+    combined: list[dict] = []
+    for search in providers:
+        remaining = want - len(combined)
+        if remaining <= 0:
+            break
+        try:
+            results = await search(query, want)
+        except HTTPException as exc:
+            last_error = exc
+            continue
+        for item in results:
+            url = item.get("url") or ""
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                combined.append(item)
+    if combined:
+        return combined
+    if last_error:
+        raise last_error
+    return []
+
+
+def _build_search_query(payload: SearchRequest) -> str:
+    """Natürliche Suchanfrage aus Freitext/Zielgruppe + Stichwörter + Region.
+
+    Space-getrennt (kein " · "), ohne Begriffe zu doppeln — damit die
+    Suchmaschine nicht künstlich eingeengt wird.
+    """
+    seed = payload.query.strip() or (f"Finde {payload.target}".strip() if payload.target else "")
+    lower = seed.lower()
+    parts = [seed] if seed else []
+    for kw in payload.keywords:
+        kw = kw.strip()
+        if kw and kw.lower() not in lower:
+            parts.append(kw)
+    if payload.region and payload.region.lower() not in lower:
+        parts.append(payload.region.strip())
+    return " ".join(p for p in parts if p).strip()
+
+
+@app.post("/api/discover")
+async def discover(payload: SearchRequest):
+    query_text = _build_search_query(payload)
+    if not query_text:
+        raise HTTPException(400, "Bitte eine Branche wählen oder eine Beschreibung eingeben.")
+    results = await _web_search(query_text, want=_SEARCH_FETCH)
+
+    # Pick distinct lead sources. Default: one company site per host, skipping
+    # social + directories. Directory mode: individual listing pages count, so
+    # de-duplicate by full URL instead of host.
+    def _in(host: str, domains: set[str]) -> bool:
+        return any(host == d or host.endswith("." + d) for d in domains)
+
+    # Bereits gefundene Firmen ausblenden (nicht im Verzeichnis-Modus, dort
+    # teilen sich Einträge denselben Host).
+    known = (
+        await db.known_websites()
+        if payload.exclude_known and not payload.include_directories
+        else set()
+    )
+
+    seen: set[str] = set()
+    candidates: list[tuple[str, str, str, str]] = []
+    skipped_social = 0
+    skipped_directory = 0
+    skipped_known = 0
+    skipped_duplicate = 0
+    for item in results:
+        url = item.get("url") or ""
+        host = (urlparse(url).hostname or "").replace("www.", "")
+        key = url if payload.include_directories else host
+        if not host:
+            continue
+        if key in seen:
+            skipped_duplicate += 1
+            continue
+        if _in(host, _ALWAYS_SKIP_DOMAINS):
+            skipped_social += 1
+            continue
+        if not payload.include_directories and _in(host, _DIRECTORY_DOMAINS):
+            skipped_directory += 1
+            continue
+        if host in known:
+            skipped_known += 1
+            continue
+        seen.add(key)
+        candidates.append((url, host, item.get("title", ""), item.get("description", "")))
+        if len(candidates) >= _DISCOVER_MAX_SITES:
+            break
+
+    search = await db.create_search(
+        query=payload.query, region=payload.region, target=payload.target, source_url=query_text
+    )
+
+    try:
+        from scrapling.fetchers import AsyncFetcher
+    except Exception:
+        AsyncFetcher = None
+
+    sem = asyncio.Semaphore(_DISCOVER_CONCURRENCY)
+
+    async def _extract(url: str, host: str, title: str, desc: str) -> dict:
+        async with sem:
+            page = None
+            if AsyncFetcher is not None:
+                try:
+                    page = await AsyncFetcher.get(url, timeout=_DISCOVER_TIMEOUT)
+                except Exception:
+                    page = None
+            if page is None:
+                # Fall back to the Brave result metadata so the lead still shows up.
+                return {"company": (title or host)[:120], "city": "", "website": host,
+                        "email": "", "phone": "", "score": 25, "description": (desc or "")[:200]}
+            body = " ".join(page.css("body ::text").getall())[:8000]
+            emails = extract_emails(body)
+            phones = extract_phones(body)
+            page_title = page.css("title::text").get(default="") or title
+            return {
+                "company": (page_title or host)[:120],
+                "city": "",
+                "website": host,
+                "email": emails[0] if emails else "",
+                "phone": phones[0] if phones else "",
+                "score": min(99, 40 + len(emails) * 15 + len(phones) * 10),
+                "description": (desc or "")[:200],
+            }
+
+    leads = list(await asyncio.gather(*[_extract(*c) for c in candidates])) if candidates else []
+    leads.sort(key=lambda item: item["score"], reverse=True)
+    if leads:
+        await db.insert_leads(search["id"], leads)
+    await db.finish_search(search["id"], len(leads))
+    # "exhausted": es gab Treffer, aber alle waren schon bekannt (Dubletten).
+    exhausted = bool(results) and not candidates and bool(known)
+    debug = {
+        "raw_hits": len(results),
+        "known_in_db": len(known),
+        "skipped_duplicate": skipped_duplicate,
+        "skipped_social": skipped_social,
+        "skipped_directory": skipped_directory,
+        "skipped_known": skipped_known,
+        "final_candidates": len(candidates),
+    }
+    print(f"[discover] query={query_text!r} db={db.BACKEND_NAME} {debug}")
+    return {
+        "search": search,
+        "leads": leads,
+        "exhausted": exhausted,
+        "raw_hits": len(results),
+        "known_filtered": skipped_known,
+        "debug": debug,
+    }
+
+
+# ---- Searches ----
+@app.post("/api/searches")
+async def create_search(payload: SearchRequest):
+    search = await db.create_search(
+        query=payload.query,
+        region=payload.region,
+        target=payload.target,
+    )
+    return search
+
+
+@app.get("/api/searches")
+async def list_searches(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
+    searches = await db.list_searches(limit=limit, offset=offset)
+    return searches
+
+
+@app.get("/api/searches/{search_id}")
+async def get_search(search_id: str):
+    s = await db.get_search(search_id)
+    if not s:
+        raise HTTPException(404, "Recherche nicht gefunden.")
+    return s
+
+
+@app.delete("/api/searches/{search_id}")
+async def delete_search(search_id: str):
+    ok = await db.delete_search(search_id)
+    if not ok:
+        raise HTTPException(404, "Recherche nicht gefunden.")
+    return {"deleted": True}
+
+
+# ---- Search update ----
+@app.patch("/api/searches/{search_id}")
+async def update_search(search_id: str, payload: SearchUpdate):
+    s = await db.get_search(search_id)
+    if not s:
+        raise HTTPException(404, "Recherche nicht gefunden.")
+    if payload.status is not None:
+        s["status"] = payload.status
+    if payload.result_count is not None:
+        s["result_count"] = payload.result_count
+    await db.finish_search(search_id, s["result_count"], s["status"])
+    return await db.get_search(search_id)
+
+
+# ---- Leads ----
+@app.post("/api/leads")
+async def save_leads(payload: LeadsBatch):
+    count = await db.insert_leads(payload.search_id, payload.leads)
+    return {"inserted": count}
+
+
+@app.get("/api/leads")
+async def list_leads(
+    search_id: str = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    leads = await db.list_leads(search_id=search_id, limit=limit, offset=offset)
+    return leads
+
+
+# ---- Stats ----
+@app.get("/api/stats")
+async def stats():
+    return await db.get_stats()
+
+
+# ---- Feedback ----
+@app.post("/api/feedback")
+async def create_feedback(payload: FeedbackCreate):
+    fb = await db.save_feedback(
+        search_id=payload.search_id,
+        rating=payload.rating,
+        comment=payload.comment,
+    )
+    return fb
+
+
+# ---- Static frontend (production) ----
+_frontend_dist = os.path.join(os.path.dirname(__file__), "..", "dist")
+if os.path.isdir(_frontend_dist):
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
