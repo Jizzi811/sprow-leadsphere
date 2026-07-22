@@ -19,7 +19,7 @@ export function Sidebar({ active, setActive, stats }) {
           <button
             key={key}
             className={active === key ? "active" : ""}
-            onClick={() => setActive(key)}
+            onClick={() => { setActive(key); document.body.classList.remove("nav-open"); }}
           >
             <Icon size={21} />
             <span>{key}</span>

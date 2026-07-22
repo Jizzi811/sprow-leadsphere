@@ -215,6 +215,7 @@ a { color: inherit; }
 .workspace header span { color: var(--muted); font-size: 12px; }
 
 .mobile-brand { display: none; }
+.nav-backdrop { display: none; }
 
 .workspace footer {
   text-align: center;
@@ -987,6 +988,16 @@ a { color: inherit; }
     transition: left 0.28s var(--ease);
   }
   .nav-open .sidebar { left: 0; box-shadow: 30px 0 80px rgba(0,0,0,.55); }
+  .nav-open .nav-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 39;
+    background: rgba(0, 0, 0, 0.55);
+    -webkit-backdrop-filter: blur(1px);
+    backdrop-filter: blur(1px);
+    animation: rise 0.2s var(--ease) both;
+  }
   .nav-open .sidebar .brand span, .nav-open .sidebar nav button span,
   .nav-open .sidebar .profile div, .nav-open .sidebar .help span { display: initial; }
   .nav-open .sidebar nav button, .nav-open .sidebar .help { justify-content: flex-start; }

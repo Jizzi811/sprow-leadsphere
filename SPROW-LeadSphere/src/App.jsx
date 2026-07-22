@@ -362,6 +362,11 @@ export function App() {
   return (
     <div className="app-shell">
       <Sidebar active={active} setActive={setActive} stats={null} />
+      <div
+        className="nav-backdrop"
+        onClick={() => document.body.classList.remove("nav-open")}
+        aria-hidden="true"
+      />
       <main className="workspace">
         <header>
           <button

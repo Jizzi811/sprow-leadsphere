@@ -1,41 +1,44 @@
-"""Async SQLite database layer for SPROW LeadSphere.
+"""Database layer for LeadSphere.
 
-Uses aiosqlite with a single reusable connection to avoid thread-restart issues.
-Easily swappable to PostgreSQL/Supabase by replacing this module.
+Dual backend:
+- If DATABASE_URL (postgres…) is set -> PostgreSQL via asyncpg (durable,
+  e.g. Supabase). Survives restarts, so the cross-search dedup is permanent.
+- Otherwise -> local SQLite via aiosqlite (ephemeral on Render free).
+
+Public async API is identical for both backends.
 """
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
-
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+_IS_PG = _DATABASE_URL.startswith(("postgres://", "postgresql://"))
 _DB_PATH = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "leadsphere.db"))
 
-# Global connection (lazily initialised, reused across requests)
-_conn: Optional[aiosqlite.Connection] = None
+_sqlite_conn = None
+_pg_pool = None
 
 
 # ---------------------------------------------------------------------------
-# Schema
+# Schema (created_at kept as ISO text in both backends for identical sorting)
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS searches (
-    id          TEXT PRIMARY KEY,
-    query       TEXT NOT NULL,
-    region      TEXT DEFAULT '',
-    target      TEXT DEFAULT '',
-    source_url  TEXT DEFAULT '',
-    status      TEXT DEFAULT 'completed',
+    id           TEXT PRIMARY KEY,
+    query        TEXT NOT NULL,
+    region       TEXT DEFAULT '',
+    target       TEXT DEFAULT '',
+    source_url   TEXT DEFAULT '',
+    status       TEXT DEFAULT 'completed',
     result_count INTEGER DEFAULT 0,
-    created_at  TEXT NOT NULL
+    created_at   TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS leads (
     id          TEXT PRIMARY KEY,
-    search_id   TEXT NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-    company     TEXT NOT NULL DEFAULT '',
+    search_id   TEXT NOT NULL,
+    company     TEXT DEFAULT '',
     city        TEXT DEFAULT '',
     website     TEXT DEFAULT '',
     email       TEXT DEFAULT '',
@@ -44,166 +47,174 @@ CREATE TABLE IF NOT EXISTS leads (
     description TEXT DEFAULT '',
     created_at  TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS feedback (
-    id          TEXT PRIMARY KEY,
-    search_id   TEXT NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-    rating      INTEGER NOT NULL CHECK(rating >= 1 AND rating <= 5),
-    comment     TEXT DEFAULT '',
-    created_at  TEXT NOT NULL
+    id         TEXT PRIMARY KEY,
+    search_id  TEXT NOT NULL,
+    rating     INTEGER NOT NULL,
+    comment    TEXT DEFAULT '',
+    created_at TEXT NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_leads_search ON leads(search_id);
-CREATE INDEX IF NOT EXISTS idx_searches_created ON searches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_leads_website ON leads(website);
+CREATE INDEX IF NOT EXISTS idx_searches_created ON searches(created_at);
 """
-
-
-# ---------------------------------------------------------------------------
-# Connection management – single shared connection
-# ---------------------------------------------------------------------------
-
-async def get_db() -> aiosqlite.Connection:
-    """Return a shared connection, creating it on first call."""
-    global _conn
-    if _conn is None:
-        _conn = await aiosqlite.connect(_DB_PATH)
-        _conn.row_factory = aiosqlite.Row
-        await _conn.executescript(_SCHEMA)
-        await _conn.commit()
-    return _conn
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def _execute(sql: str, params=()):
-    """Helper: acquire the shared connection and execute."""
-    db = await get_db()
-    c = await db.execute(sql, params)
-    await db.commit()
-    return c
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+async def _get_sqlite():
+    global _sqlite_conn
+    if _sqlite_conn is None:
+        import aiosqlite
+        _sqlite_conn = await aiosqlite.connect(_DB_PATH)
+        _sqlite_conn.row_factory = aiosqlite.Row
+        await _sqlite_conn.executescript(_SCHEMA)
+        await _sqlite_conn.commit()
+    return _sqlite_conn
+
+
+async def _get_pg():
+    global _pg_pool
+    if _pg_pool is None:
+        import asyncpg
+        # statement_cache_size=0 keeps us compatible with Supabase's pgbouncer
+        # (transaction pooling) connection strings.
+        _pg_pool = await asyncpg.create_pool(
+            _DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0
+        )
+        async with _pg_pool.acquire() as con:
+            for stmt in filter(str.strip, _SCHEMA.split(";")):
+                await con.execute(stmt)
+    return _pg_pool
+
+
+def _to_pg(sql: str) -> str:
+    """Translate '?' placeholders into '$1, $2, …' for asyncpg."""
+    out, idx = [], 0
+    for ch in sql:
+        if ch == "?":
+            idx += 1
+            out.append(f"${idx}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+async def _exec(sql: str, *params):
+    if _IS_PG:
+        pool = await _get_pg()
+        async with pool.acquire() as con:
+            await con.execute(_to_pg(sql), *params)
+        return
+    con = await _get_sqlite()
+    await con.execute(sql, params)
+    await con.commit()
+
+
+async def _fetch(sql: str, *params) -> list[dict]:
+    if _IS_PG:
+        pool = await _get_pg()
+        async with pool.acquire() as con:
+            rows = await con.fetch(_to_pg(sql), *params)
+        return [dict(r) for r in rows]
+    con = await _get_sqlite()
+    cur = await con.execute(sql, params)
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
-# Searches CRUD
+# Searches
 # ---------------------------------------------------------------------------
 
-async def create_search(
-    query: str,
-    region: str = "",
-    target: str = "",
-    source_url: str = "",
-) -> dict:
+async def create_search(query: str, region: str = "", target: str = "", source_url: str = "") -> dict:
     sid = uuid.uuid4().hex[:12]
     now = _iso_now()
-    db = await get_db()
-    await db.execute(
+    await _exec(
         "INSERT INTO searches (id, query, region, target, source_url, result_count, created_at) "
         "VALUES (?, ?, ?, ?, ?, 0, ?)",
-        (sid, query, region, target, source_url, now),
+        sid, query, region, target, source_url, now,
     )
-    await db.commit()
     return {"id": sid, "query": query, "region": region, "target": target,
             "source_url": source_url, "status": "running", "result_count": 0, "created_at": now}
 
 
 async def finish_search(search_id: str, result_count: int, status: str = "completed"):
-    db = await get_db()
-    await db.execute(
-        "UPDATE searches SET status=?, result_count=? WHERE id=?",
-        (status, result_count, search_id),
-    )
-    await db.commit()
+    await _exec("UPDATE searches SET status = ?, result_count = ? WHERE id = ?",
+                status, result_count, search_id)
 
 
 async def list_searches(limit: int = 20, offset: int = 0) -> list[dict]:
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        "SELECT * FROM searches ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (limit, offset),
-    )
-    return [dict(r) for r in rows]
+    return await _fetch(
+        "SELECT * FROM searches ORDER BY created_at DESC LIMIT ? OFFSET ?", limit, offset)
 
 
 async def get_search(search_id: str) -> Optional[dict]:
-    db = await get_db()
-    row = await db.execute_fetchall("SELECT * FROM searches WHERE id=?", (search_id,))
-    return dict(row[0]) if row else None
+    rows = await _fetch("SELECT * FROM searches WHERE id = ?", search_id)
+    return rows[0] if rows else None
 
 
 async def delete_search(search_id: str) -> bool:
-    db = await get_db()
-    await db.execute("DELETE FROM leads WHERE search_id=?", (search_id,))
-    await db.execute("DELETE FROM feedback WHERE search_id=?", (search_id,))
-    c = await db.execute("DELETE FROM searches WHERE id=?", (search_id,))
-    await db.commit()
-    return c.rowcount > 0
+    await _exec("DELETE FROM leads WHERE search_id = ?", search_id)
+    await _exec("DELETE FROM feedback WHERE search_id = ?", search_id)
+    if _IS_PG:
+        rows = await _fetch("DELETE FROM searches WHERE id = ? RETURNING id", search_id)
+        return len(rows) > 0
+    con = await _get_sqlite()
+    cur = await con.execute("DELETE FROM searches WHERE id = ?", (search_id,))
+    await con.commit()
+    return cur.rowcount > 0
 
 
 async def get_stats() -> dict:
-    db = await get_db()
-    total = (await db.execute_fetchall("SELECT COUNT(*) FROM searches"))[0][0]
-    total_leads = (await db.execute_fetchall("SELECT COALESCE(SUM(result_count),0) FROM searches"))[0][0]
+    total = (await _fetch("SELECT COUNT(*) AS c FROM searches"))[0]["c"]
+    total_leads = (await _fetch("SELECT COALESCE(SUM(result_count), 0) AS c FROM searches"))[0]["c"]
     today = _iso_now()[:10]
-    today_count = (await db.execute_fetchall(
-        "SELECT COUNT(*) FROM searches WHERE created_at >= ?", (today,)
-    ))[0][0]
-    return {"total_searches": total, "total_leads": total_leads, "today_searches": today_count}
+    today_count = (await _fetch(
+        "SELECT COUNT(*) AS c FROM searches WHERE created_at >= ?", today))[0]["c"]
+    return {"total_searches": int(total), "total_leads": int(total_leads),
+            "today_searches": int(today_count)}
 
 
 # ---------------------------------------------------------------------------
-# Leads CRUD
+# Leads
 # ---------------------------------------------------------------------------
 
 async def insert_leads(search_id: str, leads: list[dict]) -> int:
     if not leads:
         return 0
     now = _iso_now()
-    rows = []
     for lead in leads:
-        rows.append((
-            uuid.uuid4().hex[:12],
-            search_id,
-            lead.get("company", ""),
-            lead.get("city", ""),
-            lead.get("website", ""),
-            lead.get("email", ""),
-            lead.get("phone", ""),
-            min(99, max(0, lead.get("score", 0))),
-            lead.get("description", ""),
-            now,
-        ))
-    db = await get_db()
-    await db.executemany(
-        "INSERT INTO leads (id, search_id, company, city, website, email, phone, score, description, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )
-    await db.commit()
-    return len(rows)
+        await _exec(
+            "INSERT INTO leads (id, search_id, company, city, website, email, phone, score, description, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            uuid.uuid4().hex[:12], search_id,
+            lead.get("company", ""), lead.get("city", ""), lead.get("website", ""),
+            lead.get("email", ""), lead.get("phone", ""),
+            min(99, max(0, int(lead.get("score", 0)))), lead.get("description", ""), now,
+        )
+    return len(leads)
 
 
 async def known_websites() -> set[str]:
     """Alle bereits gefundenen Lead-Websites (für Dubletten-Filter)."""
-    db = await get_db()
-    rows = await db.execute_fetchall("SELECT DISTINCT website FROM leads WHERE website != ''")
-    return {r[0] for r in rows if r[0]}
+    rows = await _fetch("SELECT DISTINCT website FROM leads WHERE website != ''")
+    return {r["website"] for r in rows if r["website"]}
 
 
 async def list_leads(search_id: Optional[str] = None, limit: int = 50, offset: int = 0) -> list[dict]:
-    db = await get_db()
     if search_id:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM leads WHERE search_id=? ORDER BY score DESC LIMIT ? OFFSET ?",
-            (search_id, limit, offset),
-        )
-    else:
-        rows = await db.execute_fetchall(
-            "SELECT * FROM leads ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-    return [dict(r) for r in rows]
+        return await _fetch(
+            "SELECT * FROM leads WHERE search_id = ? ORDER BY score DESC LIMIT ? OFFSET ?",
+            search_id, limit, offset)
+    return await _fetch(
+        "SELECT * FROM leads ORDER BY created_at DESC LIMIT ? OFFSET ?", limit, offset)
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +224,8 @@ async def list_leads(search_id: Optional[str] = None, limit: int = 50, offset: i
 async def save_feedback(search_id: str, rating: int, comment: str = "") -> dict:
     fid = uuid.uuid4().hex[:12]
     now = _iso_now()
-    db = await get_db()
-    await db.execute(
+    await _exec(
         "INSERT INTO feedback (id, search_id, rating, comment, created_at) VALUES (?, ?, ?, ?, ?)",
-        (fid, search_id, rating, comment, now),
+        fid, search_id, rating, comment, now,
     )
-    await db.commit()
     return {"id": fid, "search_id": search_id, "rating": rating, "comment": comment, "created_at": now}
