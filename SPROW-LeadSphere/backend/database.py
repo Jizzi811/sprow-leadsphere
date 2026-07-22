@@ -18,6 +18,11 @@ _DB_PATH = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "l
 
 _sqlite_conn = None
 _pg_pool = None
+_pg_failed = False  # set True if the Postgres connection is misconfigured/unreachable
+
+
+def _use_pg() -> bool:
+    return _IS_PG and not _pg_failed
 
 
 # ---------------------------------------------------------------------------
@@ -106,27 +111,55 @@ def _to_pg(sql: str) -> str:
     return "".join(out)
 
 
+def _pg_fallback(exc: Exception):
+    """Ein kaputter/erreichbarer DATABASE_URL darf die App nicht lahmlegen —
+    einmalig auf SQLite umschalten statt bei jeder Anfrage 500 zu werfen."""
+    global _pg_failed
+    if not _pg_failed:
+        _pg_failed = True
+        print(f"[db] Postgres nicht verfügbar -> SQLite-Fallback: {exc}", flush=True)
+
+
 async def _exec(sql: str, *params):
-    if _IS_PG:
-        pool = await _get_pg()
-        async with pool.acquire() as con:
-            await con.execute(_to_pg(sql), *params)
-        return
+    if _use_pg():
+        try:
+            pool = await _get_pg()
+            async with pool.acquire() as con:
+                await con.execute(_to_pg(sql), *params)
+            return
+        except Exception as exc:
+            _pg_fallback(exc)
     con = await _get_sqlite()
     await con.execute(sql, params)
     await con.commit()
 
 
 async def _fetch(sql: str, *params) -> list[dict]:
-    if _IS_PG:
-        pool = await _get_pg()
-        async with pool.acquire() as con:
-            rows = await con.fetch(_to_pg(sql), *params)
-        return [dict(r) for r in rows]
+    if _use_pg():
+        try:
+            pool = await _get_pg()
+            async with pool.acquire() as con:
+                rows = await con.fetch(_to_pg(sql), *params)
+            return [dict(r) for r in rows]
+        except Exception as exc:
+            _pg_fallback(exc)
     con = await _get_sqlite()
     cur = await con.execute(sql, params)
     rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def ping() -> dict:
+    """Trigger a connection and report the effective backend (for /health)."""
+    try:
+        await _fetch("SELECT 1 AS ok")
+    except Exception:
+        pass
+    return {
+        "backend": "postgres" if _use_pg() else "sqlite",
+        "pg_configured": _IS_PG,
+        "pg_failed": _pg_failed,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +196,7 @@ async def get_search(search_id: str) -> Optional[dict]:
 async def delete_search(search_id: str) -> bool:
     await _exec("DELETE FROM leads WHERE search_id = ?", search_id)
     await _exec("DELETE FROM feedback WHERE search_id = ?", search_id)
-    if _IS_PG:
+    if _use_pg():
         rows = await _fetch("DELETE FROM searches WHERE id = ? RETURNING id", search_id)
         return len(rows) > 0
     con = await _get_sqlite()

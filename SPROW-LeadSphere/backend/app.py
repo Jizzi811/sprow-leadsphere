@@ -140,7 +140,7 @@ def extract_phones(text: str) -> list[str]:
 @app.get("/health")
 async def health():
     return {"status": "ok", "engine": "scrapling", "version": "1.0.0",
-            "db": _DB_PATH if (_DB_PATH := os.getenv("DATABASE_PATH", "leadsphere.db")) else ":memory:",
+            "db": await db.ping(),
             "origins": ALLOWED_ORIGINS}
 
 
