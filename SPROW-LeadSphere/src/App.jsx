@@ -169,12 +169,19 @@ export function App() {
       const [s, l] = await Promise.all([api.listSearches(50, 0), api.listLeads(null, 200, 0)]);
       setSearches(s);
       setAllLeads(l);
+      const d = data.debug || {};
+      const parts = [];
+      if (d.skipped_known) parts.push(`${d.skipped_known} bereits bekannt`);
+      if (d.skipped_social) parts.push(`${d.skipped_social} Social/Aggregator`);
+      if (d.skipped_directory) parts.push(`${d.skipped_directory} Verzeichnis`);
+      if (d.skipped_duplicate) parts.push(`${d.skipped_duplicate} doppelter Host`);
+      const breakdown = parts.length ? ` (von ${d.raw_hits} Rohtreffern: ${parts.join(", ")} übersprungen)` : "";
       setNotice(
         found.length
-          ? `${found.length} neue Firmen gefunden und geprüft.`
+          ? `${found.length} neue Firmen gefunden und geprüft.${breakdown}`
           : data.exhausted
-          ? "Keine neuen Firmen – alle Treffer wurden schon gefunden. Ändere die Parameter für mehr."
-          : "Keine passenden Firmen gefunden – formuliere die Suche etwas anders."
+          ? `Keine neuen Firmen – alle Treffer wurden schon gefunden.${breakdown} Ändere die Parameter für mehr.`
+          : `Keine passenden Firmen gefunden.${breakdown} Formuliere die Suche etwas anders.`
       );
     } catch (err) {
       setNotice(`Web-Recherche fehlgeschlagen: ${err.message}`);
