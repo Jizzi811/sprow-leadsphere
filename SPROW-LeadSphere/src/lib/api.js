@@ -26,13 +26,22 @@ async function request(path, options = {}) {
 }
 
 // ---- Health ----
-export async function checkHealth() {
-  try {
-    const data = await request("/health");
-    return data;
-  } catch {
-    return null;
+// Render's free tier spins the backend down after ~15 min of no traffic;
+// waking it back up can take 30-60s. A single failed check here used to
+// strand the whole session in demo mode (fixed 5 fictional leads) until a
+// manual page reload. Retrying with backoff gives the cold start time to
+// finish instead of giving up after the first failed attempt.
+export async function checkHealth({ attempts = 5, delayMs = 4000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const data = await request("/health");
+      if (data && data.status === "ok") return data;
+    } catch {
+      // keep retrying — likely still waking up
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
   }
+  return null;
 }
 
 // ---- Extract (single website) ----
