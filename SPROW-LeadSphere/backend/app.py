@@ -80,11 +80,14 @@ class ExtractRequest(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=500)
+    query: str = Field(default="", max_length=500)
     region: str = ""
     target: str = ""
+    keywords: list[str] = Field(default_factory=list, max_length=25)
     # "Firmen ohne Webseite": search directory listings instead of company sites.
     include_directories: bool = False
+    # Bereits gefundene Firmen bei Wiederholung ausblenden.
+    exclude_known: bool = True
 
 
 class FeedbackCreate(BaseModel):
@@ -219,24 +222,37 @@ async def _brave_search(query: str, want: int) -> list[dict]:
 
 
 async def _serpapi_search(query: str, want: int) -> list[dict]:
-    # Google via SerpAPI returns up to ~100 results in a single request.
-    try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            resp = await client.get(
-                SERPAPI_ENDPOINT,
-                params={"engine": "google", "q": query, "num": min(want, 100),
-                        "gl": "de", "hl": "de", "api_key": SERPAPI_KEY},
+    # Google returns ~10 organic results per page; paginate via `start` to
+    # gather more. NOTE: each page counts as one SerpAPI search credit.
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=25) as client:
+        for start in range(0, want, 10):
+            try:
+                resp = await client.get(
+                    SERPAPI_ENDPOINT,
+                    params={"engine": "google", "q": query, "start": start, "num": 10,
+                            "gl": "de", "hl": "de", "api_key": SERPAPI_KEY},
+                )
+            except Exception as exc:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
+            if resp.status_code == 429:
+                if out:
+                    break
+                raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
+            if resp.status_code != 200:
+                if out:
+                    break
+                raise HTTPException(502, f"Web-Suche fehlgeschlagen (SerpAPI {resp.status_code}).")
+            batch = resp.json().get("organic_results", [])
+            out.extend(
+                {"url": r.get("link", ""), "title": r.get("title", ""), "description": r.get("snippet", "")}
+                for r in batch
             )
-    except Exception as exc:
-        raise HTTPException(502, f"Web-Suche nicht erreichbar: {exc}") from exc
-    if resp.status_code == 429:
-        raise HTTPException(429, "Web-Suche: Ratenlimit erreicht, bitte kurz warten.")
-    if resp.status_code != 200:
-        raise HTTPException(502, f"Web-Suche fehlgeschlagen (SerpAPI {resp.status_code}).")
-    return [
-        {"url": r.get("link", ""), "title": r.get("title", ""), "description": r.get("snippet", "")}
-        for r in resp.json().get("organic_results", [])
-    ]
+            if len(batch) < 8 or len(out) >= want:
+                break
+    return out
 
 
 async def _tavily_search(query: str, want: int) -> list[dict]:
@@ -296,9 +312,29 @@ async def _web_search(query: str, want: int) -> list[dict]:
     return []
 
 
+def _build_search_query(payload: SearchRequest) -> str:
+    """Natürliche Suchanfrage aus Freitext/Zielgruppe + Stichwörter + Region.
+
+    Space-getrennt (kein " · "), ohne Begriffe zu doppeln — damit die
+    Suchmaschine nicht künstlich eingeengt wird.
+    """
+    seed = payload.query.strip() or (f"Finde {payload.target}".strip() if payload.target else "")
+    lower = seed.lower()
+    parts = [seed] if seed else []
+    for kw in payload.keywords:
+        kw = kw.strip()
+        if kw and kw.lower() not in lower:
+            parts.append(kw)
+    if payload.region and payload.region.lower() not in lower:
+        parts.append(payload.region.strip())
+    return " ".join(p for p in parts if p).strip()
+
+
 @app.post("/api/discover")
 async def discover(payload: SearchRequest):
-    query_text = " ".join(p for p in [payload.query, payload.region, payload.target] if p).strip()
+    query_text = _build_search_query(payload)
+    if not query_text:
+        raise HTTPException(400, "Bitte eine Branche wählen oder eine Beschreibung eingeben.")
     results = await _web_search(query_text, want=_SEARCH_FETCH)
 
     # Pick distinct lead sources. Default: one company site per host, skipping
@@ -306,6 +342,14 @@ async def discover(payload: SearchRequest):
     # de-duplicate by full URL instead of host.
     def _in(host: str, domains: set[str]) -> bool:
         return any(host == d or host.endswith("." + d) for d in domains)
+
+    # Bereits gefundene Firmen ausblenden (nicht im Verzeichnis-Modus, dort
+    # teilen sich Einträge denselben Host).
+    known = (
+        await db.known_websites()
+        if payload.exclude_known and not payload.include_directories
+        else set()
+    )
 
     seen: set[str] = set()
     candidates: list[tuple[str, str, str, str]] = []
@@ -318,6 +362,8 @@ async def discover(payload: SearchRequest):
         if _in(host, _ALWAYS_SKIP_DOMAINS):
             continue
         if not payload.include_directories and _in(host, _DIRECTORY_DOMAINS):
+            continue
+        if host in known:
             continue
         seen.add(key)
         candidates.append((url, host, item.get("title", ""), item.get("description", "")))
@@ -366,7 +412,9 @@ async def discover(payload: SearchRequest):
     if leads:
         await db.insert_leads(search["id"], leads)
     await db.finish_search(search["id"], len(leads))
-    return {"search": search, "leads": leads}
+    # "exhausted": es gab Treffer, aber alle waren schon bekannt (Dubletten).
+    exhausted = bool(results) and not candidates and bool(known)
+    return {"search": search, "leads": leads, "exhausted": exhausted}
 
 
 # ---- Searches ----

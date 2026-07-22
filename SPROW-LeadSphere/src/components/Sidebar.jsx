@@ -1,4 +1,4 @@
-import { SolarPanel, MagnifyingGlass, Users, ListBullets, ChartBar, CaretDown, Question } from "@phosphor-icons/react";
+import { SolarPanel, MagnifyingGlass, Users, ListBullets, ChartBar, Question } from "@phosphor-icons/react";
 
 const NAV_ITEMS = [
   { key: "Neue Recherche", icon: MagnifyingGlass },
@@ -30,14 +30,6 @@ export function Sidebar({ active, setActive, stats }) {
         ))}
       </nav>
       <div className="sidebar-bottom">
-        <div className="profile">
-          <span>GS</span>
-          <div>
-            <strong>Gabi Sprow</strong>
-            <small>EnergyTeam Sprow</small>
-          </div>
-          <CaretDown />
-        </div>
         <button className="help">
           <Question size={20} />
           <span>Hilfe & Support</span>

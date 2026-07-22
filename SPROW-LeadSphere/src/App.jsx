@@ -6,7 +6,7 @@ import { LeadsTable } from "./components/LeadsTable.jsx";
 import { HistoryTable } from "./components/HistoryTable.jsx";
 import { Dashboard } from "./components/Dashboard.jsx";
 import { ParticleOrb } from "./components/ParticleOrb.jsx";
-import { VERTICALS, composeQuery } from "./lib/verticals.js";
+import { VERTICALS } from "./lib/verticals.js";
 import * as api from "./lib/api.js";
 
 function useToast() {
@@ -154,13 +154,16 @@ export function App() {
   }, [region, target]);
 
   // ---- Discover companies from a description (web search -> extraction) ----
-  const runDiscovery = useCallback(async (q) => {
+  const runDiscovery = useCallback(async () => {
     setLive(true);
     setLeads([]);
     setProgress(0);
     setNotice("Durchsuche das Web nach passenden Firmen … (kann bis zu einer Minute dauern)");
     try {
-      const data = await api.discover(q, region, target, !!vertical?.directories);
+      const data = await api.discover({
+        query, region, target, keywords,
+        includeDirectories: !!vertical?.directories,
+      });
       const found = data.leads || [];
       setLeads(found);
       const [s, l] = await Promise.all([api.listSearches(50, 0), api.listLeads(null, 200, 0)]);
@@ -168,7 +171,9 @@ export function App() {
       setAllLeads(l);
       setNotice(
         found.length
-          ? `${found.length} Firmen im Web gefunden und geprüft.`
+          ? `${found.length} neue Firmen gefunden und geprüft.`
+          : data.exhausted
+          ? "Keine neuen Firmen – alle Treffer wurden schon gefunden. Ändere die Parameter für mehr."
           : "Keine passenden Firmen gefunden – formuliere die Suche etwas anders."
       );
     } catch (err) {
@@ -176,23 +181,22 @@ export function App() {
     } finally {
       setLive(false);
     }
-  }, [region, target, vertical]);
+  }, [query, region, target, keywords, vertical]);
 
   // ---- Submit search ----
   const startSearch = useCallback((e) => {
     e?.preventDefault();
     setActive("Neue Recherche");
-    // Freitext + Zielgruppe + eigene Parameter zu einer Beschreibung komponieren.
-    const q = composeQuery({ freeText: query, target, keywords });
-    if (!q) {
+    const free = query.trim();
+    if (!free && !target) {
       setNotice("Bitte wähle eine Branche oder beschreibe, wen LeadSphere finden soll.");
       return;
     }
-    // A domain/URL -> extract that one site; a description -> discover via web search.
-    const urlMatch = query.trim().match(/^((?:https?:\/\/)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?)$/i);
+    // A pure domain/URL -> extract that one site; otherwise discover via web search.
+    const urlMatch = free.match(/^((?:https?:\/\/)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/[^\s]*)?)$/i);
     if (hasBackend) {
       if (urlMatch) runLiveExtraction(urlMatch[0]);
-      else runDiscovery(q);
+      else runDiscovery();
       return;
     }
     // Offline demo mode (no backend detected).
@@ -200,7 +204,7 @@ export function App() {
     setLeads([]);
     setProgress(0);
     setSearching(true);
-  }, [query, target, keywords, hasBackend, runLiveExtraction, runDiscovery]);
+  }, [query, target, hasBackend, runLiveExtraction, runDiscovery]);
 
   // ---- Delete search ----
   const handleDelete = useCallback(async (searchId) => {
@@ -360,8 +364,7 @@ export function App() {
             <SquaresFour /> LeadSphere
           </button>
           <div>
-            <strong>Guten Morgen, Gabi Sprow</strong>
-            <span>{new Date().toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" })}</span>
+            <span>{new Date().toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</span>
           </div>
         </header>
         {backendLoading ? (

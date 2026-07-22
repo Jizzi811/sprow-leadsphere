@@ -184,6 +184,13 @@ async def insert_leads(search_id: str, leads: list[dict]) -> int:
     return len(rows)
 
 
+async def known_websites() -> set[str]:
+    """Alle bereits gefundenen Lead-Websites (für Dubletten-Filter)."""
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT DISTINCT website FROM leads WHERE website != ''")
+    return {r[0] for r in rows if r[0]}
+
+
 async def list_leads(search_id: Optional[str] = None, limit: int = 50, offset: int = 0) -> list[dict]:
     db = await get_db()
     if search_id:
